@@ -1,22 +1,31 @@
 (() => {
   const EXT_NAME = "Forge Neo Finish Notifier";
   const CHECK_INTERVAL_MS = 1000;
-  const NOTIFY_COOLDOWN_MS = 3000;
+  const NOTIFY_COOLDOWN_MS = 10000;
   const SOUND_STORAGE_KEY = "forge_neo_finish_notifier_sound_enabled";
 
   // Ignore the first few monitor loops to avoid false notifications during Forge Neo startup.
   // This is state-based, not time-based, so it is more robust across different PCs/browsers.
   const STARTUP_SYNC_LOOPS = 3;
 
+  // Ignore finish detection immediately after a tab visibility change.
+  // This prevents duplicate notifications caused by Brave/Chrome re-evaluating the page state.
+  const VISIBILITY_GUARD_MS = 3000;
+
   let wasGenerating = false;
   let startupSyncCount = 0;
   let lastNotify = 0;
+  let lastVisibilityChange = 0;
   let generationStartTime = null;
   let button = null;
   let soundButton = null;
   let statusLabel = null;
   let elapsedLabel = null;
   let soundEnabled = localStorage.getItem(SOUND_STORAGE_KEY) !== "false";
+
+  document.addEventListener("visibilitychange", () => {
+    lastVisibilityChange = Date.now();
+  });
 
   function isNotificationSupported() {
     return "Notification" in window;
@@ -32,6 +41,7 @@
 
   function formatDuration(ms) {
     if (!Number.isFinite(ms) || ms < 0) return "Unknown";
+
     const totalSeconds = Math.max(1, Math.round(ms / 1000));
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
@@ -127,6 +137,7 @@
 
       oscillator.connect(gain);
       gain.connect(audioContext.destination);
+
       oscillator.start();
       oscillator.stop(audioContext.currentTime + 0.38);
 
@@ -247,14 +258,15 @@
     panel.appendChild(elapsedLabel);
     panel.appendChild(button);
     panel.appendChild(soundButton);
-    document.body.appendChild(panel);
 
+    document.body.appendChild(panel);
     updateButtonState();
     updateSoundButtonState();
   }
 
   function notifyDone() {
     const now = Date.now();
+
     if (now - lastNotify < NOTIFY_COOLDOWN_MS) return;
 
     lastNotify = now;
@@ -285,6 +297,7 @@
     if (!el) return false;
 
     const style = window.getComputedStyle(el);
+
     return style.display !== "none" && style.visibility !== "hidden" && el.offsetParent !== null;
   }
 
@@ -303,6 +316,7 @@
 
     const hasActiveStopButton = [...document.querySelectorAll("button")].some((b) => {
       const text = (b.textContent || "").trim();
+
       return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text) && !b.disabled && isVisible(b);
     });
 
@@ -326,12 +340,14 @@
     updateElapsedLabel(generating);
     updateButtonState();
     updateSoundButtonState();
+
     return true;
   }
 
   function loop() {
     try {
       const generating = isGenerating();
+      const now = Date.now();
 
       if (syncStartupState(generating)) {
         return;
@@ -342,7 +358,11 @@
       }
 
       if (wasGenerating && !generating) {
-        notifyDone();
+        // Do not notify immediately after tab switching.
+        // Keep generationStartTime intact here so the real finish notification still has duration.
+        if (now - lastVisibilityChange >= VISIBILITY_GUARD_MS) {
+          notifyDone();
+        }
       }
 
       if (!generating && !wasGenerating) {
