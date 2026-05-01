@@ -1,8 +1,8 @@
 (() => {
-  const EXT_NAME = "Forge Neo Finish Notifier";
+  const EXT_NAME = "Forge Neo Generation Notifier";
   const CHECK_INTERVAL_MS = 1000;
   const NOTIFY_COOLDOWN_MS = 10000;
-  const SOUND_STORAGE_KEY = "forge_neo_finish_notifier_sound_enabled";
+  const SOUND_STORAGE_KEY = "forge_neo_generation_notifier_sound_enabled";
 
   // Ignore the first few monitor loops to avoid false notifications during Forge Neo startup.
   // This is state-based, not time-based, so it is more robust across different PCs/browsers.
