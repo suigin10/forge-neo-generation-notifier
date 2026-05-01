@@ -195,10 +195,10 @@
   }
 
   function createFloatingButton() {
-    if (document.getElementById("forge-neo-finish-notifier-panel")) return;
+    if (document.getElementById("forge-neo-generation-notifier-panel")) return;
 
     const panel = document.createElement("div");
-    panel.id = "forge-neo-finish-notifier-panel";
+    panel.id = "forge-neo-generation-notifier-panel";
     panel.style.position = "fixed";
     panel.style.right = "16px";
     panel.style.bottom = "16px";
@@ -215,7 +215,7 @@
     panel.style.backdropFilter = "blur(4px)";
 
     const title = document.createElement("div");
-    title.textContent = "Finish Notifier";
+    title.textContent = "Generation Notifier";
     title.style.fontWeight = "bold";
     title.style.textAlign = "center";
 
