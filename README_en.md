@@ -1,4 +1,4 @@
-# Forge Neo Finish Notifier
+# Forge Neo Generation Notifier
 
 A simple generation-complete notification extension for Forge Neo / Stable Diffusion WebUI.
 
