@@ -1,109 +1,88 @@
 # Forge Neo Finish Notifier
 
-A simple browser notification extension for Forge Neo / Stable Diffusion WebUI-based interfaces.
+Forge Neo / Stable Diffusion WebUI系向けのシンプルな生成完了通知拡張です。
 
-This extension adds its own notification panel and does not depend on Forge Neo's built-in **Request Browser Notification** button.
+Forge Neo本体の「Request Browser Notification」機能には依存せず、
+独自に生成状態を監視して通知を行います。
 
-## Features
+\---
 
-* Shows a small **Finish Notifier** panel in the bottom-right corner
-* Provides an independent browser notification permission/test button
-* Sends a browser notification when image generation finishes
-* Plays a short notification sound when generation finishes
-* Detects generation state by monitoring visible progress indicators and active stop/interrupt buttons
-* Prevents false completion notifications on initial page load
+## 機能
 
-## Installation
+* 画面右下に通知パネルを表示
+* 独立した通知許可・テストボタン
+* 生成完了時にブラウザ通知を表示
+* 通知音の再生
+* 進行バーや停止ボタンから生成状態を検出
+* 初回ページロード時の誤通知を防止
 
-1. Copy this extension folder into Forge Neo's `extensions` folder.
-2. Restart Forge Neo.
-3. Open Forge Neo in your browser.
-4. Click the **Enable notifications** button in the bottom-right panel.
-5. If the test notification appears, setup is complete.
+\---
 
-## How it works
+## 導入方法
 
-The script checks the page state periodically.
+1. このフォルダを Forge Neo の `extensions` フォルダに配置
+2. Forge Neo を再起動
+3. ブラウザで Forge Neo を開く
+4. 右下の「Enable notifications」をクリック
+5. テスト通知が出れば設定完了
 
-On the first check, it only records the current state. This prevents a false **Generation complete** notification when the page is opened or refreshed.
+\---
 
-After that, it sends a notification only when the state changes from:
+## 動作仕様
 
-```text
-generating -> not generating
-```
+スクリプトは以下の状態変化のみ通知します：
 
-## Browser notification requirements
+生成中 → 非生成状態
 
-Browser notifications require a secure context.
+\---
 
-Recommended access URL:
+## 通知が動作する条件
 
-```text
+ブラウザ通知には「安全な接続」が必要です。
+
+推奨URL：
 http://localhost:7860
-```
 
-If you access Forge Neo from another device or via a LAN IP address, browsers such as Brave may block notifications because the page is treated as insecure.
+\---
 
-Example Brave launch option:
+## LANアクセス時の注意（Braveなど）
 
-```text
+LAN IPでアクセスすると通知がブロックされる場合があります。
+
+ブラウザのショートカットのプロパティで接続を許可してください。
+
+Braveの例：
 "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe" --unsafely-treat-insecure-origin-as-secure="http://localhost:7860,http://192.168.1.1:7860"
-```
 
-Replace `192.168.1.101:7860` with your own Forge Neo LAN address.
+\---
 
-## Button labels
+## ボタン表示の意味
 
-Depending on the browser notification state, the panel button may show:
+* Enable notifications：通知未許可
+* Test notification：通知許可済み
+* Allow in browser settings：通知ブロック中
+* HTTPS/localhost required：安全な接続ではない
+* Not supported：ブラウザ非対応
 
-* **Enable notifications**: notification permission has not been requested yet
-* **Test notification**: notifications are already allowed
-* **Allow in browser settings**: notifications are blocked
-* **HTTPS/localhost required**: the page is not running in a secure context
-* **Not supported**: the browser does not support the Notification API
+\---
 
-## Troubleshooting
+## トラブルシューティング
 
-### No notification appears
+### 通知が出ない
 
-Check the following:
+* localhostでアクセスしているか確認
+* 通知許可を確認
+* OSの通知設定を確認
 
-* Open Forge Neo via `http://localhost:7860`
-* Confirm that browser notifications are allowed for the site
-* If using a LAN IP address, make sure the browser is launched with the secure-origin option
-* Check whether your OS notification settings are blocking browser notifications
+\---
 
-### A notification appears on first page load
-
-This version is designed to prevent that behavior.
-
-If it still happens, check that the latest `javascript/finish\_notifier.js` has been installed and that the browser is not using a cached old script.
-
-### The button does nothing
-
-Open the browser console and check for JavaScript errors.
-
-In Brave/Chrome/Edge:
-
-```text
-F12 -> Console
-```
-
-## Files
-
-```text
-forge-neo-finish-notifier/
-├─ javascript/
-│  └─ finish\_notifier.js
-└─ README.md
-```
-
-## Version
+## バージョン
 
 v1.0.1
 
-## License
+\---
+
+## ライセンス
 
 MIT
 
