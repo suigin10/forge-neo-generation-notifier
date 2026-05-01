@@ -1,4 +1,4 @@
-# Forge Neo Finish Notifier
+# Forge Neo Generation Notifier
 
 Forge Neo / Stable Diffusion WebUI向けの、生成完了を通知するシンプルな拡張です。
 
