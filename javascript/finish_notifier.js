@@ -2,30 +2,70 @@
   const EXT_NAME = "Forge Neo Finish Notifier";
   const CHECK_INTERVAL_MS = 1000;
   const NOTIFY_COOLDOWN_MS = 3000;
+  const SOUND_STORAGE_KEY = "forge_neo_finish_notifier_sound_enabled";
 
-  let initialized = false;
   let wasGenerating = false;
   let lastNotify = 0;
+  let generationStartTime = null;
 
   let button = null;
+  let soundButton = null;
   let statusLabel = null;
+  let elapsedLabel = null;
+
+  let soundEnabled = localStorage.getItem(SOUND_STORAGE_KEY) !== "false";
 
   function isNotificationSupported() {
     return "Notification" in window;
   }
 
   function getPermissionText() {
-    if (!isNotificationSupported()) return "Notifications not supported";
+    if (!isNotificationSupported()) return "Notification API unavailable";
     if (!window.isSecureContext) return "Insecure connection";
     if (Notification.permission === "granted") return "Notifications enabled";
     if (Notification.permission === "denied") return "Notifications blocked";
     return "Notifications not allowed";
   }
 
+  function formatDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "Unknown";
+
+    const totalSeconds = Math.max(1, Math.round(ms / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+
+    if (minutes <= 0) {
+      return `${seconds}s`;
+    }
+
+    return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  }
+
+  function updateElapsedLabel(generating) {
+    if (!elapsedLabel) return;
+
+    if (generating && generationStartTime) {
+      elapsedLabel.textContent = `Running: ${formatDuration(Date.now() - generationStartTime)}`;
+      elapsedLabel.style.display = "block";
+      return;
+    }
+
+    elapsedLabel.textContent = "";
+    elapsedLabel.style.display = "none";
+  }
+
+  function updateSoundButtonState() {
+    if (!soundButton) return;
+
+    soundButton.textContent = soundEnabled ? "Sound: ON" : "Sound: OFF";
+    soundButton.title = soundEnabled ? "Disable notification sound" : "Enable notification sound";
+  }
+
   function updateButtonState() {
     if (!button || !statusLabel) return;
 
-    statusLabel.textContent = getPermissionText();
+    const text = getPermissionText();
+    statusLabel.textContent = text;
 
     if (!isNotificationSupported()) {
       button.disabled = true;
@@ -55,6 +95,48 @@
     button.textContent = "Enable notifications";
   }
 
+  function toggleSound() {
+    soundEnabled = !soundEnabled;
+    localStorage.setItem(SOUND_STORAGE_KEY, String(soundEnabled));
+    updateSoundButtonState();
+
+    if (soundEnabled) {
+      playSound();
+    }
+  }
+
+  function playSound() {
+    if (!soundEnabled) return;
+
+    try {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+
+      const audioContext = new AudioContext();
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
+
+      gain.gain.setValueAtTime(0.0001, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.18, audioContext.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.35);
+
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + 0.38);
+
+      oscillator.addEventListener("ended", () => {
+        audioContext.close().catch(() => {});
+      });
+    } catch (e) {
+      console.warn(`[${EXT_NAME}] sound failed`, e);
+    }
+  }
+
   async function requestOrTestNotification() {
     try {
       if (!isNotificationSupported()) {
@@ -63,10 +145,7 @@
       }
 
       if (!window.isSecureContext) {
-        alert(
-          "Notifications require HTTPS or a secure localhost context. " +
-          "Open Forge Neo via http://localhost:7860, or mark the LAN URL as secure in your browser launch options."
-        );
+        alert("Browser notifications require HTTPS or a localhost secure context. Open Forge Neo via http://localhost:7860, or allow this URL as a secure origin in your browser settings.");
         return;
       }
 
@@ -77,22 +156,35 @@
 
       if (Notification.permission === "granted") {
         new Notification("Forge Neo notification test", {
-          body: "Notifications are enabled. You will be notified when generation finishes.",
-          silent: false
+          body: "Notifications are enabled. You will be notified when generation is complete.",
+          silent: !soundEnabled
         });
+
+        playSound();
       }
 
       updateButtonState();
     } catch (e) {
       console.warn(`[${EXT_NAME}] request/test notification failed`, e);
-      alert("Failed to enable or test notifications. Please check the browser console.");
+      alert("Failed to enable notifications. Please check the console.");
     }
+  }
+
+  function applyButtonStyle(target, background) {
+    target.style.padding = "6px 10px";
+    target.style.border = "0";
+    target.style.borderRadius = "8px";
+    target.style.cursor = "pointer";
+    target.style.fontWeight = "bold";
+    target.style.background = background;
+    target.style.color = "white";
   }
 
   function createFloatingButton() {
     if (document.getElementById("forge-neo-finish-notifier-panel")) return;
 
     const panel = document.createElement("div");
+
     panel.id = "forge-neo-finish-notifier-panel";
     panel.style.position = "fixed";
     panel.style.right = "16px";
@@ -118,16 +210,20 @@
     statusLabel.style.textAlign = "center";
     statusLabel.style.opacity = "0.9";
 
+    elapsedLabel = document.createElement("div");
+    elapsedLabel.style.textAlign = "center";
+    elapsedLabel.style.opacity = "0.85";
+    elapsedLabel.style.display = "none";
+
     button = document.createElement("button");
     button.type = "button";
-    button.style.padding = "6px 10px";
-    button.style.border = "0";
-    button.style.borderRadius = "8px";
-    button.style.cursor = "pointer";
-    button.style.fontWeight = "bold";
-    button.style.background = "#3b82f6";
-    button.style.color = "white";
+    applyButtonStyle(button, "#3b82f6");
     button.addEventListener("click", requestOrTestNotification);
+
+    soundButton = document.createElement("button");
+    soundButton.type = "button";
+    applyButtonStyle(soundButton, "#475569");
+    soundButton.addEventListener("click", toggleSound);
 
     const close = document.createElement("button");
     close.type = "button";
@@ -146,44 +242,43 @@
     panel.appendChild(close);
     panel.appendChild(title);
     panel.appendChild(statusLabel);
+    panel.appendChild(elapsedLabel);
     panel.appendChild(button);
+    panel.appendChild(soundButton);
+
     document.body.appendChild(panel);
 
     updateButtonState();
+    updateSoundButtonState();
   }
 
   function notifyDone() {
     const now = Date.now();
 
     if (now - lastNotify < NOTIFY_COOLDOWN_MS) return;
+
     lastNotify = now;
+
+    const durationText = generationStartTime
+      ? `Generation time: ${formatDuration(now - generationStartTime)}`
+      : "Generation time: Unknown";
 
     try {
       if (isNotificationSupported() && Notification.permission === "granted") {
         new Notification("Generation complete", {
-          body: "Forge Neo generation has finished.",
-          silent: false
+          body: `Forge Neo generation has finished.\n${durationText}`,
+          silent: !soundEnabled
         });
       } else {
-        console.log(`[${EXT_NAME}] generation finished, but notifications are not granted`);
+        console.log(`[${EXT_NAME}] generation finished, but notification is not granted`);
       }
     } catch (e) {
       console.warn(`[${EXT_NAME}] notification failed`, e);
     }
 
-    playNotificationSound();
-  }
-
-  function playNotificationSound() {
-    try {
-      const audio = new Audio(
-        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YVYGAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAk5qkrrSqpJqLfnRmUExIR0lPXG12gYqPm5+gn6Copqagn56bmJeUkY2IfnRuZ2JeWlhZYGp2go2VmZuen6CenZuYl5WQjYJ5cWhaVU5KSEtQWmZygIqUmp+ho6KhoJ6amJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoJ6bmJaSjYh8dm1jW15cXmRseIKNlpueoKCgoA="
-      );
-      audio.volume = 0.6;
-      audio.play().catch(() => {});
-    } catch (e) {
-      // Ignore sound playback errors.
-    }
+    playSound();
+    generationStartTime = null;
+    updateElapsedLabel(false);
   }
 
   function isVisible(el) {
@@ -191,11 +286,7 @@
 
     const style = window.getComputedStyle(el);
 
-    return (
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
-      el.offsetParent !== null
-    );
+    return style.display !== "none" && style.visibility !== "hidden" && el.offsetParent !== null;
   }
 
   function isGenerating() {
@@ -207,18 +298,16 @@
       "[class*='progress']"
     ];
 
-    const hasVisibleProgress = progressCandidates.some((selector) => {
+    const hasVisibleProgress = progressCandidates.some(selector => {
       return [...document.querySelectorAll(selector)].some(isVisible);
     });
 
-    const hasActiveStopButton = [...document.querySelectorAll("button")].some((buttonElement) => {
-      const text = (buttonElement.textContent || "").trim();
+    const hasActiveStopButton = [...document.querySelectorAll("button")].some(b => {
+      const text = (b.textContent || "").trim();
 
-      return (
-        /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text) &&
-        !buttonElement.disabled &&
-        isVisible(buttonElement)
-      );
+      return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text)
+        && !b.disabled
+        && isVisible(b);
     });
 
     return hasVisibleProgress || hasActiveStopButton;
@@ -228,22 +317,23 @@
     try {
       const generating = isGenerating();
 
-      // First loop only records the current state.
-      // This prevents a false "generation complete" notification on initial page load.
-      if (!initialized) {
-        initialized = true;
-        wasGenerating = generating;
-        updateButtonState();
-        console.log(`[${EXT_NAME}] initialized. generating=${generating}`);
-        return;
+      if (!wasGenerating && generating) {
+        generationStartTime = Date.now();
       }
 
       if (wasGenerating && !generating) {
         notifyDone();
       }
 
+      if (!generating && !wasGenerating) {
+        generationStartTime = null;
+      }
+
       wasGenerating = generating;
+
+      updateElapsedLabel(generating);
       updateButtonState();
+      updateSoundButtonState();
     } catch (e) {
       console.warn(`[${EXT_NAME}] loop failed`, e);
     }
@@ -252,7 +342,6 @@
   function init() {
     createFloatingButton();
     setInterval(loop, CHECK_INTERVAL_MS);
-    loop();
     console.log(`[${EXT_NAME}] loaded`);
   }
 
