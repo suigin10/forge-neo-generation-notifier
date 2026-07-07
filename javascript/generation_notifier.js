@@ -1,55 +1,85 @@
 (() => {
   const EXT_NAME = "Generation Notifier";
-  const CHECK_INTERVAL_MS = 1000;
-  const NOTIFY_COOLDOWN_MS = 10000;
   const SOUND_STORAGE_KEY = "generation_notifier_sound_enabled";
 
-  // Ignore the first few monitor loops to avoid false notifications during Forge Neo startup.
-  // This is state-based, not time-based, so it is more robust across different PCs/browsers.
+  const CHECK_INTERVAL_MS = 1000;
   const STARTUP_SYNC_LOOPS = 3;
+  const NOTIFY_COOLDOWN_MS = 2500;
 
-  // Ignore finish detection immediately after a tab visibility change.
-  // This prevents duplicate notifications caused by Brave/Chrome re-evaluating the page state.
-  const VISIBILITY_GUARD_MS = 3000;
-
-  // Network/progress mode:
-  // DOM and gallery changes are too noisy in Forge Neo.
-  // Do not notify on /queue/join or /run/predict responses.
-  // Notify only on Gradio queue process_completed, or on progress API becoming inactive
-  // after it was observed active for this generation.
-  const GENERATE_CAPTURE_WINDOW_MS = 10000;
+  const GENERATE_CAPTURE_WINDOW_MS = 12000;
   const PENDING_CAPTURE_TIMEOUT_MS = 20000;
   const PROGRESS_API_RETRY_MS = 15000;
   const PROGRESS_FINISH_CONFIRM_LOOPS = 2;
+  const DOM_FINISH_CONFIRM_LOOPS = 3;
 
-  // Image preview/lightbox guard:
-  // Opening an image preview or switching tabs during generation can make Gradio emit
-  // UI-only queue/progress changes. Do not notify while those guards are active.
+  const MIN_QUEUE_COMPLETION_AGE_MS = 2500;
+  const MIN_WEAK_QUEUE_COMPLETION_AGE_MS = 6000;
+  const MIN_DOM_COMPLETION_AGE_MS = 4500;
+
+  const QUEUE_COMPLETION_CONFIRM_DELAY_MS = 700;
+  const DEFERRED_COMPLETION_FALLBACK_MS = 2500;
+  const TRUSTED_QUEUE_GUARD_BYPASS_MS = 1200;
+  const DISCARD_COMPLETION_AFTER_START_MS = 3500;
+  const IGNORED_EVENT_ID_TTL_MS = 30000;
+
+  const GENERATE_PRESS_LOCK_MS = 1200;
+  const INTERRUPT_PRESS_LOCK_MS = 800;
+  const GENERATE_WHILE_RUNNING_IGNORE_MS = 1500;
+  const READY_DOM_FINISH_CONFIRM_LOOPS = 2;
+
+  const VISIBILITY_GUARD_MS = 3000;
+  const GENERIC_UI_GUARD_MS = 6500;
   const IMAGE_PREVIEW_GUARD_MS = 4500;
-  const IMAGE_PREVIEW_MODAL_CLOSE_GUARD_MS = 2500;
-  const UI_INTERACTION_GUARD_MS = 3500;
-  const QUEUE_COMPLETION_CONFIRM_DELAY_MS = 800;
-  const DEFERRED_COMPLETION_FALLBACK_MS = 2000;
+  const IMAGE_PREVIEW_MODAL_CLOSE_GUARD_MS = 3000;
+  const RECENT_PROGRESS_ACTIVE_BLOCK_MS = 2500;
 
-  let wasGenerating = false;
+  const INTERRUPT_SETTLE_GRACE_MS = 1000;
+  const INTERRUPT_FORCE_FINISH_MS = 10000;
+  const INTERRUPT_RECENT_PROGRESS_BLOCK_MS = 1800;
+
+  const STATE_IDLE = "idle";
+  const STATE_PENDING = "pending";
+  const STATE_RUNNING = "running";
+  const STATE_STOPPING = "stopping";
+
+  let state = STATE_IDLE;
+  let runId = 0;
   let startupSyncCount = 0;
+  let loopBusy = false;
+  let networkHooksInstalled = false;
+  let notificationBridgeInstalled = false;
+  let ownNotificationDepth = 0;
+  let lastExternalNotificationSignal = 0;
+
+  let generationStartTime = null;
+  let pendingStartedAt = 0;
+  let captureUntil = 0;
+  let stopRequestedAt = 0;
+  let activeQueueEventIds = new Set();
+  let ignoredQueueEventIds = new Map();
+  let discardCompletionsUntil = 0;
+
+  let seenQueueRunning = false;
+  let seenProgressActive = false;
+  let seenDomRunning = false;
+  let hadRunningEvidence = false;
+  let progressInactiveLoops = 0;
+  let domInactiveLoops = 0;
+  let lastProgressActiveAt = 0;
+  let lastDomRunningAt = 0;
+  let progressApiBackoffUntil = 0;
+
   let lastNotify = 0;
   let lastVisibilityChange = 0;
+  let lastUserInteractionAt = 0;
   let lastImagePreviewInteraction = 0;
   let lastImagePreviewModalSeenAt = 0;
-  let lastUiInteractionDuringGeneration = 0;
-  let deferredCompletionReason = "";
-  let deferredCompletionAt = 0;
-  let generationStartTime = null;
-  let generationCaptureUntil = 0;
-  let pendingCaptureStartedAt = 0;
-  let activeQueueEventIds = new Set();
-  let activeNetworkGeneration = false;
-  let seenProgressApiActive = false;
-  let progressApiInactiveLoops = 0;
-  let progressApiBackoffUntil = 0;
-  let networkHooksInstalled = false;
-  let loopBusy = false;
+  let pendingCompletion = null;
+  let generatePressLockedUntil = 0;
+  let interruptPressLockedUntil = 0;
+  let lastGeneratePressAt = 0;
+  let readyDomInactiveLoops = 0;
+
   let button = null;
   let soundButton = null;
   let statusLabel = null;
@@ -59,6 +89,15 @@
   document.addEventListener("visibilitychange", () => {
     lastVisibilityChange = Date.now();
   });
+
+  function log(message, extra) {
+    if (extra !== undefined) {
+      console.log(`[${EXT_NAME}] ${message}`, extra);
+      return;
+    }
+
+    console.log(`[${EXT_NAME}] ${message}`);
+  }
 
   function isNotificationSupported() {
     return "Notification" in window;
@@ -79,17 +118,14 @@
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
 
-    if (minutes <= 0) {
-      return `${seconds}s`;
-    }
-
+    if (minutes <= 0) return `${seconds}s`;
     return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
   }
 
-  function updateElapsedLabel(generating) {
+  function updateElapsedLabel(show) {
     if (!elapsedLabel) return;
 
-    if (generating && generationStartTime) {
+    if (show && generationStartTime) {
       elapsedLabel.textContent = `Running: ${formatDuration(Date.now() - generationStartTime)}`;
       elapsedLabel.style.display = "block";
       return;
@@ -144,9 +180,7 @@
     localStorage.setItem(SOUND_STORAGE_KEY, String(soundEnabled));
     updateSoundButtonState();
 
-    if (soundEnabled) {
-      playSound();
-    }
+    if (soundEnabled) playSound();
   }
 
   function playSound() {
@@ -181,6 +215,20 @@
     }
   }
 
+  function createBrowserNotification(title, options) {
+    if (!isNotificationSupported() || Notification.permission !== "granted") return null;
+
+    ownNotificationDepth += 1;
+
+    try {
+      return new Notification(title, options);
+    } finally {
+      window.setTimeout(() => {
+        ownNotificationDepth = Math.max(0, ownNotificationDepth - 1);
+      }, 0);
+    }
+  }
+
   async function requestOrTestNotification() {
     try {
       if (!isNotificationSupported()) {
@@ -202,7 +250,7 @@
       }
 
       if (Notification.permission === "granted") {
-        new Notification("Generation Notifier test", {
+        createBrowserNotification("Generation Notifier test", {
           body: "Notifications are enabled.\nYou will be notified when generation is complete.",
           silent: !soundEnabled,
         });
@@ -296,66 +344,298 @@
     updateSoundButtonState();
   }
 
-  function notifyDone() {
+  function notifyDone(startTime, reason) {
     const now = Date.now();
 
-    if (now - lastNotify < NOTIFY_COOLDOWN_MS) return;
+    if (now - lastNotify < NOTIFY_COOLDOWN_MS) {
+      log(`notification skipped by cooldown (${reason})`);
+      return;
+    }
 
     lastNotify = now;
 
-    const durationText = generationStartTime
-      ? `Generation time: ${formatDuration(now - generationStartTime)}`
+    const durationText = startTime
+      ? `Generation time: ${formatDuration(now - startTime)}`
       : "Generation time: Unknown";
 
     try {
       if (isNotificationSupported() && Notification.permission === "granted") {
-        new Notification("Generation complete", {
+        createBrowserNotification("Generation complete", {
           body: `Forge Neo generation has finished.\n${durationText}`,
           silent: !soundEnabled,
         });
       } else {
-        console.log(`[${EXT_NAME}] generation finished, but notification is not granted`);
+        log("generation finished, but notification is not granted");
       }
     } catch (e) {
       console.warn(`[${EXT_NAME}] notification failed`, e);
     }
 
     playSound();
-    generationStartTime = null;
-    updateElapsedLabel(false);
   }
 
   function isVisible(el) {
     if (!el) return false;
-
     const style = window.getComputedStyle(el);
-
     return style.display !== "none" && style.visibility !== "hidden" && el.offsetParent !== null;
   }
 
-  function resetGenerationTracking() {
-    generationCaptureUntil = 0;
-    pendingCaptureStartedAt = 0;
+  function cleanupIgnoredQueueEventIds() {
+    const now = Date.now();
+
+    for (const [id, expiresAt] of ignoredQueueEventIds.entries()) {
+      if (expiresAt <= now) ignoredQueueEventIds.delete(id);
+    }
+  }
+
+  function retireActiveQueueEventIds(reason) {
+    const expiresAt = Date.now() + IGNORED_EVENT_ID_TTL_MS;
+
+    for (const id of activeQueueEventIds) {
+      ignoredQueueEventIds.set(id, expiresAt);
+    }
+
+    if (activeQueueEventIds.size > 0) {
+      log(`retired ${activeQueueEventIds.size} old queue event_id(s) via ${reason}`);
+    }
+
     activeQueueEventIds.clear();
-    activeNetworkGeneration = false;
-    seenProgressApiActive = false;
-    progressApiInactiveLoops = 0;
-    deferredCompletionReason = "";
-    deferredCompletionAt = 0;
+  }
+
+  function resetUiGuardsForNewRun() {
+    lastUserInteractionAt = 0;
+    lastImagePreviewInteraction = 0;
+    lastImagePreviewModalSeenAt = 0;
+    pendingCompletion = null;
+  }
+
+  function resetRunFields(options = {}) {
+    if (options.retireQueueEvents) {
+      retireActiveQueueEventIds(options.reason || "reset");
+    } else {
+      activeQueueEventIds.clear();
+    }
+
+    cleanupIgnoredQueueEventIds();
+    seenQueueRunning = false;
+    seenProgressActive = false;
+    seenDomRunning = false;
+    hadRunningEvidence = false;
+    progressInactiveLoops = 0;
+    domInactiveLoops = 0;
+    readyDomInactiveLoops = 0;
+    lastProgressActiveAt = 0;
+    lastDomRunningAt = 0;
+    stopRequestedAt = 0;
+    pendingCompletion = null;
+  }
+
+  function resetToIdle(reason) {
+    log(`reset to idle via ${reason}`);
+    runId += 1;
+    state = STATE_IDLE;
+    generationStartTime = null;
+    pendingStartedAt = 0;
+    captureUntil = 0;
+    resetRunFields();
+    discardCompletionsUntil = 0;
+    resetUiGuardsForNewRun();
+    updateElapsedLabel(false);
+  }
+
+  function startNewRun(reason) {
+    const now = Date.now();
+
+    // Repeated Generate clicks before Gradio has emitted queue/progress signals
+    // must not create a new run generation. If we reset the run here, the real
+    // queue event_id may be lost and the later process_completed can be ignored.
+    if (state === STATE_PENDING && pendingStartedAt && now - pendingStartedAt < PENDING_CAPTURE_TIMEOUT_MS) {
+      log(`ignored repeated Generate while pending via ${reason} (run ${runId})`);
+      return;
+    }
+
+    // If a real generation is already visible, a Generate-looking event is
+    // usually the reused Gradio button before its label/DOM has settled.
+    if ((state === STATE_RUNNING || state === STATE_STOPPING) && looksGeneratingFromDom()) {
+      log(`ignored Generate while generation UI is active via ${reason} (run ${runId})`);
+      return;
+    }
+
+    // A rapid Interrupt -> Generate can leave old queue/data or delayed
+    // completion callbacks in flight. Bump runId first, retire old event_id(s),
+    // and ignore completion-like messages for a short start window.
+    runId += 1;
+    resetRunFields({ retireQueueEvents: true, reason });
+    resetUiGuardsForNewRun();
+
+    state = STATE_PENDING;
+    readyDomInactiveLoops = 0;
+    generationStartTime = null;
+    pendingStartedAt = now;
+    captureUntil = now + GENERATE_CAPTURE_WINDOW_MS;
+    discardCompletionsUntil = now + DISCARD_COMPLETION_AFTER_START_MS;
+
+    log(`new generation armed via ${reason} (run ${runId})`);
+    updateElapsedLabel(false);
+  }
+
+  function markRunning(reason) {
+    if (state === STATE_IDLE && Date.now() > captureUntil) return;
+
+    if (!generationStartTime) generationStartTime = Date.now();
+
+    if (state !== STATE_RUNNING) {
+      log(`generation running via ${reason} (run ${runId})`);
+    }
+
+    state = STATE_RUNNING;
+    pendingStartedAt = 0;
+    captureUntil = 0;
+    pendingCompletion = null;
+
+    if (/queue|process_starts|process_generating/i.test(String(reason || ""))) {
+      seenQueueRunning = true;
+    }
+
+    hadRunningEvidence = true;
+    updateElapsedLabel(true);
+  }
+
+  function requestStop(reason) {
+    if (state === STATE_IDLE) return;
+
+    if (state === STATE_STOPPING && stopRequestedAt > 0) {
+      log(`ignored duplicate interrupt/stop via ${reason} (run ${runId})`);
+      return;
+    }
+
+    state = STATE_STOPPING;
+    stopRequestedAt = Date.now();
+    pendingStartedAt = 0;
+    captureUntil = 0;
+    pendingCompletion = null;
+    domInactiveLoops = 0;
+    readyDomInactiveLoops = 0;
+    progressInactiveLoops = 0;
+
+    if (!generationStartTime) generationStartTime = Date.now();
+
+    log(`interrupt/stop requested via ${reason} (run ${runId})`);
+    updateElapsedLabel(true);
+  }
+
+  function finishRun(reason, options = {}) {
+    if (state === STATE_IDLE) return;
+
+    const startTime = generationStartTime;
+    log(`generation finished via ${reason} (run ${runId})`);
+
+    runId += 1;
+    state = STATE_IDLE;
+    generationStartTime = null;
+    pendingStartedAt = 0;
+    captureUntil = 0;
+    resetRunFields({ retireQueueEvents: true, reason: `finish ${reason}` });
+    discardCompletionsUntil = 0;
+    resetUiGuardsForNewRun();
+    updateElapsedLabel(false);
+
+    if (options.notify !== false) {
+      notifyDone(startTime, reason);
+    }
+  }
+
+  function getGenerationAgeMs() {
+    return generationStartTime ? Date.now() - generationStartTime : 0;
+  }
+
+  function getActionButton(target) {
+    const b = target?.closest?.("button, input[type='button'], input[type='submit']");
+    if (!b || b.closest("#generation-notifier-panel")) return null;
+    return b;
+  }
+
+  function getButtonActionText(b) {
+    if (!b) return "";
+
+    return [
+      b.textContent || "",
+      b.value || "",
+      b.getAttribute?.("aria-label") || "",
+      b.getAttribute?.("title") || "",
+      b.id || ""
+    ].join(" ");
+  }
+
+  function isInterruptActionText(text) {
+    return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(String(text || ""));
+  }
+
+  function isGenerateActionText(text) {
+    return /generate|生成/i.test(String(text || ""));
   }
 
   function isGenerateButtonTarget(target) {
-    const b = target?.closest?.("button");
-    if (!b || b.closest("#generation-notifier-panel")) return false;
+    const b = getActionButton(target);
+    if (!b || b.disabled || !isVisible(b)) return false;
+
+    const text = getButtonActionText(b);
+
+    // Some Gradio builds keep txt2img_generate / img2img_generate as the same
+    // element while changing its label to Interrupt / Stop. In that case the
+    // button must be treated as an interrupt, not as a new Generate press.
+    if (isInterruptActionText(text)) return false;
 
     if (b.id === "txt2img_generate" || b.id === "img2img_generate") {
       return true;
     }
 
-    const text = (b.textContent || "").trim();
+    return isGenerateActionText(text);
+  }
 
-    return /generate|生成/i.test(text) &&
-      !/interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
+  function isInterruptButtonTarget(target) {
+    const b = getActionButton(target);
+    if (!b || b.disabled || !isVisible(b)) return false;
+
+    return isInterruptActionText(getButtonActionText(b));
+  }
+
+  function acceptGeneratePress(reason) {
+    const now = Date.now();
+
+    // One physical click usually produces pointerdown and click.
+    // Only collapse those very-near duplicate edges. Do not use a long lock here:
+    // long Generate locks are exactly what can leave an old timer alive during
+    // rapid Interrupt -> Generate operations.
+    if (now - lastGeneratePressAt < 180) {
+      log(`ignored duplicate Generate edge ${reason}`);
+      return false;
+    }
+
+    // If an actual interrupt/stop control is visible, a Generate-looking event
+    // during the same moment is probably the reused Gradio button before its
+    // label/DOM settled. Do not create a new run from that false edge.
+    if (state !== STATE_IDLE && looksGeneratingFromDom() && !looksReadyForGenerationFromDom()) {
+      log(`ignored Generate ${reason} while interrupt/stop UI is visible`);
+      lastGeneratePressAt = now;
+      return false;
+    }
+
+    lastGeneratePressAt = now;
+    generatePressLockedUntil = now + 180;
+    return true;
+  }
+
+  function acceptInterruptPress(reason) {
+    const now = Date.now();
+
+    if (now < interruptPressLockedUntil) {
+      log(`ignored duplicate interrupt ${reason}`);
+      return false;
+    }
+
+    interruptPressLockedUntil = now + INTERRUPT_PRESS_LOCK_MS;
+    return true;
   }
 
   function isImagePreviewTarget(target) {
@@ -381,55 +661,7 @@
     if (!el) return false;
 
     const rect = el.getBoundingClientRect();
-
-    // Avoid tiny icons. Generated images/previews are usually much larger.
     return rect.width >= 24 && rect.height >= 24;
-  }
-
-  function armImagePreviewGuard() {
-    lastImagePreviewInteraction = Date.now();
-    console.log(`[${EXT_NAME}] image preview guard armed`);
-  }
-
-  function armUiInteractionGuard(reason) {
-    if (!activeNetworkGeneration && !pendingCaptureStartedAt && !wasGenerating) return;
-
-    lastUiInteractionDuringGeneration = Date.now();
-    console.log(`[${EXT_NAME}] UI interaction guard armed: ${reason}`);
-  }
-
-  function isGenerationTabTarget(target) {
-    if (!target?.closest || target.closest("#generation-notifier-panel")) return false;
-
-    const tab = target.closest('button, [role="tab"], .tabitem, .tabs button, label, a');
-    if (!tab || tab.closest("#generation-notifier-panel")) return false;
-
-    const text = [
-      tab.textContent || "",
-      tab.getAttribute?.("aria-label") || "",
-      tab.getAttribute?.("title") || "",
-      tab.id || ""
-    ].join(" ").trim();
-
-    return /txt2img|img2img|extras|png info|settings|extensions|checkpoint|lora|textual inversion|hypernetworks|テキスト|画像|設定|拡張|チェックポイント/i.test(text);
-  }
-
-  function looksGeneratingFromDom() {
-    const buttons = Array.from(document.querySelectorAll("button"));
-
-    return buttons.some((b) => {
-      if (!isVisible(b) || b.disabled) return false;
-      if (b.closest("#generation-notifier-panel")) return false;
-
-      const text = [
-        b.textContent || "",
-        b.getAttribute?.("aria-label") || "",
-        b.getAttribute?.("title") || "",
-        b.id || ""
-      ].join(" ");
-
-      return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
-    });
   }
 
   function elementLooksVisible(el) {
@@ -480,12 +712,25 @@
       const coversViewport = rect.width >= window.innerWidth * 0.35 &&
         rect.height >= window.innerHeight * 0.35;
 
-      if (hasLargeMedia && coversViewport) {
-        return true;
-      }
+      if (hasLargeMedia && coversViewport) return true;
     }
 
     return false;
+  }
+
+  function markUserInteraction(reason) {
+    if (state === STATE_IDLE) return;
+
+    lastUserInteractionAt = Date.now();
+    log(`UI guard armed: ${reason}`);
+  }
+
+  function markImagePreviewInteraction() {
+    if (state === STATE_IDLE) return;
+
+    lastImagePreviewInteraction = Date.now();
+    lastUserInteractionAt = lastImagePreviewInteraction;
+    log("image preview guard armed");
   }
 
   function isImagePreviewGuardActive() {
@@ -502,60 +747,95 @@
 
   function isCompletionGuardActive() {
     const now = Date.now();
-    const visibilityGuardActive = now - lastVisibilityChange < VISIBILITY_GUARD_MS;
-    const previewGuardActive = isImagePreviewGuardActive();
-    const uiInteractionGuardActive = now - lastUiInteractionDuringGeneration < UI_INTERACTION_GUARD_MS;
-
-    return visibilityGuardActive || previewGuardActive || uiInteractionGuardActive;
+    return now - lastVisibilityChange < VISIBILITY_GUARD_MS ||
+      now - lastUserInteractionAt < GENERIC_UI_GUARD_MS ||
+      isImagePreviewGuardActive();
   }
 
-  function deferCompletion(reason) {
-    deferredCompletionReason = reason;
-    deferredCompletionAt = Date.now();
-    console.log(`[${EXT_NAME}] deferred completion via ${reason} while UI guard is active`);
+  function looksReadyForGenerationFromDom() {
+    const buttons = Array.from(document.querySelectorAll("button, input[type='button'], input[type='submit']"));
+    let hasGenerate = false;
+    let hasInterrupt = false;
+
+    for (const b of buttons) {
+      if (!isVisible(b) || b.disabled) continue;
+      if (b.closest("#generation-notifier-panel")) continue;
+
+      const text = getButtonActionText(b);
+
+      if (isInterruptActionText(text)) {
+        hasInterrupt = true;
+        break;
+      }
+
+      if (isGenerateActionText(text) || b.id === "txt2img_generate" || b.id === "img2img_generate") {
+        hasGenerate = true;
+      }
+    }
+
+    return hasGenerate && !hasInterrupt;
   }
 
-  function clearDeferredCompletion(reason) {
-    if (!deferredCompletionReason) return;
+  function looksGeneratingFromDom() {
+    const buttons = Array.from(document.querySelectorAll("button, input[type='button'], input[type='submit']"));
 
-    console.log(`[${EXT_NAME}] cleared deferred completion via ${reason}`);
-    deferredCompletionReason = "";
-    deferredCompletionAt = 0;
-  }
+    return buttons.some((b) => {
+      if (!isVisible(b) || b.disabled) return false;
+      if (b.closest("#generation-notifier-panel")) return false;
 
-  function armGenerationCapture() {
-    // Prepare for a fresh generation attempt.
-    resetGenerationTracking();
-    generationCaptureUntil = Date.now() + GENERATE_CAPTURE_WINDOW_MS;
-    pendingCaptureStartedAt = Date.now();
-    generationStartTime = Date.now();
+      const text = [
+        b.textContent || "",
+        b.value || "",
+        b.getAttribute?.("aria-label") || "",
+        b.getAttribute?.("title") || "",
+        b.id || ""
+      ].join(" ");
 
-    console.log(`[${EXT_NAME}] armed generation capture`);
-    updateElapsedLabel(true);
+      return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
+    });
   }
 
   document.addEventListener("pointerdown", (event) => {
-    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isImagePreviewTarget(event.target)) {
-      armImagePreviewGuard();
+    // Interrupt/Stop must win over Generate. Some UIs reuse the generate
+    // button element/id while changing only the label during generation.
+    if (isInterruptButtonTarget(event.target)) {
+      if (acceptInterruptPress("pointerdown")) requestStop("interrupt pointerdown");
+      return;
     }
 
-    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isGenerationTabTarget(event.target)) {
-      armUiInteractionGuard("tab/panel interaction");
+    if (isGenerateButtonTarget(event.target)) {
+      if (acceptGeneratePress("pointerdown")) startNewRun("generate pointerdown");
+      return;
+    }
+
+    if (state !== STATE_IDLE) {
+      if (isImagePreviewTarget(event.target)) {
+        markImagePreviewInteraction();
+      } else if (!event.target?.closest?.("#generation-notifier-panel")) {
+        markUserInteraction("pointerdown");
+      }
     }
   }, true);
 
   document.addEventListener("click", (event) => {
-    if (isGenerateButtonTarget(event.target)) {
-      armGenerationCapture();
+    // Interrupt/Stop must win over Generate. Some UIs reuse the generate
+    // button element/id while changing only the label during generation.
+    if (isInterruptButtonTarget(event.target)) {
+      if (acceptInterruptPress("click")) requestStop("interrupt click");
       return;
     }
 
-    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isImagePreviewTarget(event.target)) {
-      armImagePreviewGuard();
+    if (isGenerateButtonTarget(event.target)) {
+      if (acceptGeneratePress("click")) startNewRun("generate click");
+      return;
     }
 
-    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isGenerationTabTarget(event.target)) {
-      armUiInteractionGuard("tab/panel interaction");
+    if (state !== STATE_IDLE) {
+      if (isImagePreviewTarget(event.target)) {
+        markImagePreviewInteraction();
+      } else if (!event.target?.closest?.("#generation-notifier-panel")) {
+        markUserInteraction("click");
+      }
     }
   }, true);
 
@@ -572,119 +852,7 @@
   }
 
   function isArmedForGenerationCapture() {
-    return Date.now() <= generationCaptureUntil;
-  }
-
-  function beginNetworkGeneration(reason) {
-    if (!generationStartTime) {
-      generationStartTime = Date.now();
-    }
-
-    clearDeferredCompletion(`generation still active (${reason})`);
-    pendingCaptureStartedAt = 0;
-    activeNetworkGeneration = true;
-    wasGenerating = true;
-
-    console.log(`[${EXT_NAME}] generation started via ${reason}`);
-    updateElapsedLabel(true);
-  }
-
-  function completeNetworkGeneration(reason, options = {}) {
-    if (!activeNetworkGeneration && !wasGenerating) return;
-
-    // Even strong queue/progress evidence should not fire a Windows/browser notification
-    // while the user is opening image preview, switching txt2img/img2img tabs, or while
-    // the page has just changed visibility. Defer instead of dropping the completion.
-    if (!options.ignoreUiGuard && isCompletionGuardActive()) {
-      deferCompletion(reason);
-      return;
-    }
-
-    if (!options.ignoreDomCheck && looksGeneratingFromDom()) {
-      clearDeferredCompletion("DOM still looks generating");
-      progressApiInactiveLoops = 0;
-      return;
-    }
-
-    console.log(`[${EXT_NAME}] generation completed via ${reason}`);
-
-    resetGenerationTracking();
-    notifyDone();
-    wasGenerating = false;
-    updateElapsedLabel(false);
-  }
-
-  function flushDeferredCompletionIfSafe() {
-    if (!deferredCompletionReason || (!activeNetworkGeneration && !wasGenerating)) return;
-
-    if (isCompletionGuardActive()) return;
-
-    const deferredAge = Date.now() - deferredCompletionAt;
-
-    if (looksGeneratingFromDom()) {
-      clearDeferredCompletion("DOM still looks generating");
-      progressApiInactiveLoops = 0;
-      return;
-    }
-
-    // If the progress API has ever confirmed activity, require it to confirm inactivity too.
-    if (seenProgressApiActive && progressApiInactiveLoops < PROGRESS_FINISH_CONFIRM_LOOPS) {
-      return;
-    }
-
-    // If progress API was not available, do not wait forever.
-    // A matched queue completion is stronger evidence than UI state, so flush after a short guard delay.
-    if (!seenProgressApiActive && deferredAge < DEFERRED_COMPLETION_FALLBACK_MS) {
-      return;
-    }
-
-    const reason = deferredCompletionReason;
-    completeNetworkGeneration(`deferred ${reason}`, { ignoreUiGuard: true });
-  }
-
-  function confirmQueueCompletion(reason) {
-    const generationToken = generationStartTime || Date.now();
-
-    window.setTimeout(async () => {
-      if (!activeNetworkGeneration && !wasGenerating) return;
-      if (generationStartTime && generationStartTime !== generationToken) return;
-
-      if (looksGeneratingFromDom()) {
-        console.log(`[${EXT_NAME}] ignored queue completion because DOM still looks generating`);
-        return;
-      }
-
-      const apiGenerating = await getProgressApiGeneratingState();
-
-      if (apiGenerating === true) {
-        console.log(`[${EXT_NAME}] ignored queue completion because progress API is still active`);
-        seenProgressApiActive = true;
-        progressApiInactiveLoops = 0;
-        clearDeferredCompletion("progress API still active after queue completion");
-        return;
-      }
-
-      if (apiGenerating === false) {
-        if (seenProgressApiActive) {
-          progressApiInactiveLoops = PROGRESS_FINISH_CONFIRM_LOOPS;
-        }
-
-        completeNetworkGeneration(reason);
-        return;
-      }
-
-      // Progress API may be unavailable when --api is not enabled or blocked.
-      // In that case, trust the queue completion, but still respect UI guards.
-      completeNetworkGeneration(reason);
-    }, QUEUE_COMPLETION_CONFIRM_DELAY_MS);
-  }
-
-  function captureQueueEventId(eventId) {
-    if (!eventId) return;
-
-    const id = String(eventId);
-    activeQueueEventIds.add(id);
-    beginNetworkGeneration(`queue event ${id}`);
+    return Date.now() <= captureUntil;
   }
 
   function isQueueJoinUrl(url) {
@@ -699,8 +867,113 @@
     return /\/run\/predict(?:\?|$)|\/api\/predict(?:\?|$)/.test(url);
   }
 
-  function shouldCaptureQueueJoin(url) {
-    return isArmedForGenerationCapture() && isQueueJoinUrl(url);
+  function captureQueueEventId(eventId) {
+    if (!eventId) return;
+
+    const id = String(eventId);
+    activeQueueEventIds.add(id);
+    markRunning(`queue event ${id}`);
+  }
+
+  function deferCompletion(reason, trustedQueue) {
+    if (state === STATE_IDLE) return;
+
+    pendingCompletion = {
+      runId,
+      reason,
+      trustedQueue: Boolean(trustedQueue),
+      at: Date.now(),
+    };
+
+    log(`deferred completion via ${reason}${trustedQueue ? " (trusted queue)" : ""}`);
+  }
+
+  function requestCompletion(reason, options = {}) {
+    if (state !== STATE_RUNNING && state !== STATE_STOPPING) return;
+
+    const age = getGenerationAgeMs();
+    const trustedQueue = Boolean(options.trustedQueue);
+    const knownEvent = Boolean(options.knownEvent);
+    const hasRunningEvidence = hadRunningEvidence || seenQueueRunning || seenProgressActive || seenDomRunning;
+
+    if (!knownEvent && Date.now() < discardCompletionsUntil) {
+      log(`ignored completion during new-run start window via ${reason}`);
+      return;
+    }
+
+    if (age < MIN_QUEUE_COMPLETION_AGE_MS && !hasRunningEvidence) {
+      log(`ignored too-early completion via ${reason} (${age}ms)`);
+      return;
+    }
+
+    if (!knownEvent && age < MIN_QUEUE_COMPLETION_AGE_MS) {
+      log(`ignored untrusted too-early completion via ${reason} (${age}ms)`);
+      return;
+    }
+
+    if (!knownEvent && !hasRunningEvidence && age < MIN_WEAK_QUEUE_COMPLETION_AGE_MS) {
+      log(`ignored weak early completion via ${reason} (${age}ms)`);
+      return;
+    }
+
+    // UI interaction during generation can emit unrelated completion-like queue messages.
+    // If the completion is not tied to the captured event_id, do not store it for later.
+    // Progress API / DOM transition will still finish the run when it really ends.
+    if (isCompletionGuardActive() && !knownEvent) {
+      log(`ignored untrusted completion during UI guard via ${reason}`);
+      return;
+    }
+
+    if (isCompletionGuardActive() && !trustedQueue && !knownEvent) {
+      deferCompletion(reason, false);
+      return;
+    }
+
+    const token = runId;
+
+    window.setTimeout(async () => {
+      if (runId !== token) return;
+      if (state !== STATE_RUNNING && state !== STATE_STOPPING) return;
+
+      const apiGenerating = await getProgressApiGeneratingState();
+
+      if (apiGenerating === true) {
+        seenProgressActive = true;
+        hadRunningEvidence = true;
+        lastProgressActiveAt = Date.now();
+        progressInactiveLoops = 0;
+        deferCompletion(reason, trustedQueue || knownEvent);
+        return;
+      }
+
+      if (isCompletionGuardActive() && !trustedQueue && !knownEvent) {
+        log(`completion confirmation blocked by UI guard via ${reason}`);
+        return;
+      }
+
+      finishRun(reason);
+    }, QUEUE_COMPLETION_CONFIRM_DELAY_MS);
+  }
+
+  function flushPendingCompletionIfSafe() {
+    if (!pendingCompletion || pendingCompletion.runId !== runId) return;
+    if (state !== STATE_RUNNING && state !== STATE_STOPPING) return;
+
+    const age = Date.now() - pendingCompletion.at;
+    const trusted = Boolean(pendingCompletion.trustedQueue);
+
+    if (isCompletionGuardActive() && !trusted) return;
+    if (isCompletionGuardActive() && trusted && age < TRUSTED_QUEUE_GUARD_BYPASS_MS) return;
+
+    if (seenProgressActive && progressInactiveLoops < PROGRESS_FINISH_CONFIRM_LOOPS && !trusted) {
+      return;
+    }
+
+    if (trusted || age >= DEFERRED_COMPLETION_FALLBACK_MS) {
+      const reason = pendingCompletion.reason;
+      pendingCompletion = null;
+      finishRun(`deferred ${reason}`);
+    }
   }
 
   function handleQueuePayload(payload) {
@@ -711,49 +984,70 @@
 
     if (!eventId && !msg) return;
 
-    // If queue/join response was missed, capture only real running events.
-    // Never capture process_completed by itself because it might belong to an old event
-    // or an unrelated image preview/lightbox interaction.
-    if (
-      eventId &&
-      activeQueueEventIds.size === 0 &&
-      (activeNetworkGeneration || isArmedForGenerationCapture()) &&
-      /process_starts|process_generating/.test(msg)
-    ) {
+    cleanupIgnoredQueueEventIds();
+
+    if (eventId && ignoredQueueEventIds.has(eventId)) {
+      log(`ignored retired queue event ${eventId} (${msg})`);
+      return;
+    }
+
+    if (msg === "process_completed" && Date.now() < discardCompletionsUntil) {
+      const knownEarlyEvent = Boolean(eventId && activeQueueEventIds.has(eventId));
+      const hasRunningEvidence = hadRunningEvidence || seenQueueRunning || seenProgressActive || seenDomRunning;
+
+      if (!knownEarlyEvent || !hasRunningEvidence) {
+        log(`discarded completion during new-run start window${eventId ? ` (${eventId})` : ""}`);
+        return;
+      }
+    }
+
+    if (eventId && activeQueueEventIds.size === 0 && (state !== STATE_IDLE || isArmedForGenerationCapture()) && /process_starts|process_generating/.test(msg)) {
       captureQueueEventId(eventId);
     }
 
-    if (eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId)) {
+    const eventIdIsDifferentFromActive =
+      Boolean(eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId));
+
+    if (eventIdIsDifferentFromActive && msg !== "process_completed") {
       return;
     }
 
     if (/process_starts|process_generating/.test(msg)) {
-      clearDeferredCompletion(`queue ${msg}`);
-      beginNetworkGeneration(`queue ${msg}`);
+      markRunning(`queue ${msg}`);
       return;
     }
 
     if (msg === "process_completed") {
-      // v1.1.3 fix:
-      // Prefer a captured Gradio event_id when it exists, but do not require it.
-      // Some Forge/Gradio builds may deliver process_completed without an event_id; dropping
-      // that message can miss a legitimate generation finish. Mismatched event_id is still ignored.
-      if (eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId)) {
-        if (activeNetworkGeneration && isCompletionGuardActive()) {
-          console.log(`[${EXT_NAME}] ignored unrelated queue completion during UI guard`);
+      if (state !== STATE_RUNNING && state !== STATE_STOPPING) return;
+
+      const knownEvent = Boolean(eventId && activeQueueEventIds.has(eventId));
+      const mismatchedEvent = Boolean(eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId));
+
+      // Rapid Generate / Interrupt operations can make the stored event_id stale.
+      // If this run has already shown real running evidence and enough time has
+      // passed, treat a mismatched process_completed as an untrusted but usable
+      // completion signal instead of dropping it forever.
+      if (mismatchedEvent) {
+        const age = getGenerationAgeMs();
+        const hasRunningEvidence = hadRunningEvidence || seenQueueRunning || seenProgressActive || seenDomRunning;
+
+        if (!hasRunningEvidence || age < MIN_WEAK_QUEUE_COMPLETION_AGE_MS) {
+          log(`ignored mismatched early completion ${eventId} (${age}ms)`);
+          return;
         }
-        return;
+
+        log(`accepted mismatched completion as fallback ${eventId} (${age}ms)`);
       }
 
-      if (!activeNetworkGeneration && !wasGenerating) return;
-
-      const label = eventId ? `queue ${eventId}` : "queue process_completed";
-      confirmQueueCompletion(label);
+      requestCompletion(eventId ? `queue ${eventId}` : "queue process_completed", {
+        trustedQueue: knownEvent,
+        knownEvent,
+      });
     }
   }
 
   function handleQueueMessageData(rawData) {
-    if (!rawData || (!activeNetworkGeneration && !isArmedForGenerationCapture())) return;
+    if (!rawData || (state === STATE_IDLE && !isArmedForGenerationCapture())) return;
 
     try {
       handleQueuePayload(JSON.parse(String(rawData)));
@@ -769,7 +1063,6 @@
       .map((line) => line.slice(5).trim());
 
     if (dataLines.length <= 0) return;
-
     handleQueueMessageData(dataLines.join("\n"));
   }
 
@@ -787,21 +1080,16 @@
 
       while (true) {
         const { value, done } = await reader.read();
-
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-
         const blocks = buffer.split(/\r?\n\r?\n/);
         buffer = blocks.pop() || "";
-
         blocks.forEach(handleSseBlock);
       }
 
       buffer += decoder.decode();
-      if (buffer.trim()) {
-        handleSseBlock(buffer);
-      }
+      if (buffer.trim()) handleSseBlock(buffer);
     } catch (e) {
       console.warn(`[${EXT_NAME}] failed to read queue/data stream`, e);
     }
@@ -827,13 +1115,13 @@
       }
 
       const data = await res.json();
-      const state = data?.state || {};
+      const stateData = data?.state || {};
 
-      const jobCount = Number(state.job_count || 0);
-      const samplingStep = Number(state.sampling_step || 0);
-      const samplingSteps = Number(state.sampling_steps || 0);
+      const jobCount = Number(stateData.job_count || 0);
+      const samplingStep = Number(stateData.sampling_step || 0);
+      const samplingSteps = Number(stateData.sampling_steps || 0);
       const progress = Number(data?.progress || 0);
-      const jobText = String(state.job || "").trim();
+      const jobText = String(stateData.job || "").trim();
 
       return (
         jobCount > 0 ||
@@ -848,41 +1136,148 @@
     }
   }
 
-  async function updateProgressApiFallback() {
-    if (!activeNetworkGeneration && !pendingCaptureStartedAt && !isArmedForGenerationCapture()) return;
+  async function updateProgressApi() {
+    if (state === STATE_IDLE) return;
 
     const apiGenerating = await getProgressApiGeneratingState();
 
     if (apiGenerating === true) {
-      seenProgressApiActive = true;
-      progressApiInactiveLoops = 0;
-      clearDeferredCompletion("progress API still active");
+      seenProgressActive = true;
+      hadRunningEvidence = true;
+      lastProgressActiveAt = Date.now();
+      progressInactiveLoops = 0;
+      pendingCompletion = null;
 
-      if (!activeNetworkGeneration) {
-        beginNetworkGeneration("progress API");
+      if (state === STATE_PENDING || state === STATE_RUNNING) {
+        markRunning("progress API");
       }
 
-      return;
-    }
-
-    if (apiGenerating === false && activeNetworkGeneration && seenProgressApiActive) {
-      if (looksGeneratingFromDom()) {
-        progressApiInactiveLoops = 0;
-        clearDeferredCompletion("DOM still looks generating after progress API false");
-        return;
-      }
-
-      progressApiInactiveLoops += 1;
-
-      if (progressApiInactiveLoops >= PROGRESS_FINISH_CONFIRM_LOOPS) {
-        completeNetworkGeneration("progress API");
-      }
-
+      // In STOPPING, active progress means the stop has not settled yet.
       return;
     }
 
     if (apiGenerating === false) {
-      progressApiInactiveLoops = 0;
+      if (state === STATE_STOPPING) {
+        if (Date.now() - stopRequestedAt >= INTERRUPT_SETTLE_GRACE_MS) {
+          finishRun("interrupt/stop progress API inactive");
+        }
+        return;
+      }
+
+      if (state === STATE_RUNNING && seenProgressActive) {
+        progressInactiveLoops += 1;
+
+        if (progressInactiveLoops >= PROGRESS_FINISH_CONFIRM_LOOPS && !isCompletionGuardActive()) {
+          finishRun("progress API inactive");
+        }
+      }
+    }
+  }
+
+  function updateDomFallback() {
+    if (state === STATE_IDLE) return;
+
+    const now = Date.now();
+    const domGenerating = looksGeneratingFromDom();
+
+    if (domGenerating) {
+      readyDomInactiveLoops = 0;
+      seenDomRunning = true;
+      hadRunningEvidence = true;
+      lastDomRunningAt = now;
+      domInactiveLoops = 0;
+
+      if (state === STATE_PENDING || state === STATE_RUNNING) {
+        markRunning("DOM stop button");
+      }
+
+      return;
+    }
+
+    const readyForNewGeneration = looksReadyForGenerationFromDom();
+
+    if (readyForNewGeneration && state === STATE_STOPPING && stopRequestedAt > 0) {
+      const stopAge = now - stopRequestedAt;
+
+      if (stopAge >= INTERRUPT_SETTLE_GRACE_MS && now - lastProgressActiveAt >= INTERRUPT_RECENT_PROGRESS_BLOCK_MS) {
+        readyDomInactiveLoops += 1;
+
+        if (readyDomInactiveLoops >= READY_DOM_FINISH_CONFIRM_LOOPS) {
+          finishRun("interrupt/stop ready DOM fallback");
+        }
+      }
+
+      return;
+    }
+
+    if (state === STATE_STOPPING && stopRequestedAt > 0) {
+      const stopAge = now - stopRequestedAt;
+
+      if (stopAge < INTERRUPT_SETTLE_GRACE_MS) return;
+      if (now - lastProgressActiveAt < INTERRUPT_RECENT_PROGRESS_BLOCK_MS) return;
+
+      // A rapid Interrupt -> Generate should have created a new run already.
+      // If it did not, do not keep the old timer forever.
+      if (stopAge >= INTERRUPT_FORCE_FINISH_MS || seenDomRunning || !seenProgressActive) {
+        finishRun("interrupt/stop DOM inactive");
+      }
+
+      return;
+    }
+
+    if (state !== STATE_RUNNING) return;
+
+    if (readyForNewGeneration) {
+      const age = getGenerationAgeMs();
+      if (hadRunningEvidence && age >= MIN_DOM_COMPLETION_AGE_MS && !isCompletionGuardActive()) {
+        readyDomInactiveLoops += 1;
+
+        if (readyDomInactiveLoops >= READY_DOM_FINISH_CONFIRM_LOOPS) {
+          finishRun("ready DOM fallback");
+        }
+      } else {
+        readyDomInactiveLoops = 0;
+      }
+      return;
+    }
+
+    // If the user clicked tabs/panels/image preview after the last visible Stop button,
+    // the Stop button may simply be hidden by the current UI. Do not use DOM fallback
+    // until we see the Stop button again, or until queue/progress confirms completion.
+    if (generationStartTime && lastUserInteractionAt > generationStartTime && lastUserInteractionAt > lastDomRunningAt) {
+      domInactiveLoops = 0;
+      return;
+    }
+
+    if (isCompletionGuardActive()) {
+      domInactiveLoops = 0;
+      return;
+    }
+
+    if (now - lastProgressActiveAt < RECENT_PROGRESS_ACTIVE_BLOCK_MS) {
+      domInactiveLoops = 0;
+      return;
+    }
+
+    const age = getGenerationAgeMs();
+
+    if (!hadRunningEvidence || age < MIN_DOM_COMPLETION_AGE_MS) {
+      domInactiveLoops = 0;
+      return;
+    }
+
+    domInactiveLoops += 1;
+
+    if (domInactiveLoops >= DOM_FINISH_CONFIRM_LOOPS) {
+      finishRun("DOM inactive fallback");
+    }
+  }
+
+  function updatePendingTimeout() {
+    if (state !== STATE_PENDING || !pendingStartedAt) return;
+
+    if (Date.now() - pendingStartedAt > PENDING_CAPTURE_TIMEOUT_MS) {
+      resetToIdle("generation capture timeout");
     }
   }
 
@@ -895,19 +1290,19 @@
     if (nativeFetch) {
       window.fetch = async function(input, init) {
         const url = getRequestUrl(input);
-        const captureQueueJoin = shouldCaptureQueueJoin(url);
+        const queueJoin = isQueueJoinUrl(url);
         const queueData = isQueueDataUrl(url);
-        const predictDuringCapture = isArmedForGenerationCapture() && isPredictUrl(url);
+        const predict = isPredictUrl(url);
+        const shouldCapture = isArmedForGenerationCapture();
 
         let response;
 
         try {
           response = await nativeFetch(input, init);
         } catch (e) {
-          if (captureQueueJoin || predictDuringCapture) {
+          if (shouldCapture && (queueJoin || predict)) {
             console.warn(`[${EXT_NAME}] captured generation request failed`, e);
           }
-
           throw e;
         }
 
@@ -915,8 +1310,8 @@
           readQueueDataStream(response.clone());
         }
 
-        if (captureQueueJoin) {
-          beginNetworkGeneration("queue/join");
+        if (queueJoin && shouldCapture) {
+          markRunning("queue/join");
 
           response.clone().json().then((data) => {
             captureQueueEventId(data?.event_id || data?.eventId);
@@ -925,11 +1320,8 @@
           });
         }
 
-        if (predictDuringCapture) {
-          // Important:
-          // Do NOT complete on /run/predict or /api/predict.
-          // In Forge/Gradio this can be only an initial/auxiliary request.
-          console.log(`[${EXT_NAME}] predict request observed; waiting for queue completion or progress API finish`);
+        if (predict && shouldCapture) {
+          log("predict request observed; waiting for queue/progress/DOM finish");
         }
 
         return response;
@@ -995,51 +1387,100 @@
       window.WebSocket = WrappedWebSocket;
     }
 
-    console.log(`[${EXT_NAME}] network hooks installed`);
+    log("network hooks installed");
   }
 
-  function isGenerating() {
-    return activeNetworkGeneration;
+  function isOwnNotifierNotification(title) {
+    const t = String(title || "");
+    return t === "Generation complete" ||
+      t === "Generation Notifier test" ||
+      /generation notifier/i.test(t);
   }
 
-  function syncStartupState(generating) {
+  function handleExternalBrowserNotification(title, options) {
+    if (ownNotificationDepth > 0) return;
+    if (isOwnNotifierNotification(title)) return;
+    if (state === STATE_IDLE) return;
+
+    const now = Date.now();
+    if (now - lastExternalNotificationSignal < 800) return;
+    lastExternalNotificationSignal = now;
+
+    log("external browser notification detected; treating current run as finished", {
+      title: String(title || ""),
+      body: String(options?.body || ""),
+      state,
+      runId,
+    });
+
+    finishRun("external browser notification", { notify: false });
+  }
+
+  function installNotificationBridge() {
+    if (notificationBridgeInstalled) return;
+    if (!isNotificationSupported()) return;
+
+    notificationBridgeInstalled = true;
+
+    try {
+      const NativeNotification = window.Notification;
+
+      if (!NativeNotification || NativeNotification.__generationNotifierBridge) return;
+
+      const WrappedNotification = new Proxy(NativeNotification, {
+        construct(target, args) {
+          const [title, options] = args;
+          const instance = Reflect.construct(target, args, target);
+
+          try {
+            handleExternalBrowserNotification(title, options || {});
+          } catch (e) {
+            console.warn(`[${EXT_NAME}] external notification bridge failed`, e);
+          }
+
+          return instance;
+        },
+        get(target, prop, receiver) {
+          if (prop === "__generationNotifierBridge") return true;
+
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+        set(target, prop, value, receiver) {
+          return Reflect.set(target, prop, value, receiver);
+        },
+      });
+
+      window.Notification = WrappedNotification;
+      log("notification bridge installed");
+    } catch (e) {
+      console.warn(`[${EXT_NAME}] failed to install notification bridge`, e);
+    }
+  }
+
+  function syncStartupState() {
     if (startupSyncCount >= STARTUP_SYNC_LOOPS) return false;
 
     startupSyncCount += 1;
-
-    // Network/progress mode should not infer startup generation state from the DOM.
-    updateElapsedLabel(generating);
+    updateElapsedLabel(false);
     updateButtonState();
     updateSoundButtonState();
-
     return true;
   }
 
   async function loop() {
     if (loopBusy) return;
-
     loopBusy = true;
 
     try {
-      const generating = isGenerating();
-      const now = Date.now();
+      if (syncStartupState()) return;
 
-      if (syncStartupState(generating)) {
-        return;
-      }
+      await updateProgressApi();
+      updateDomFallback();
+      flushPendingCompletionIfSafe();
+      updatePendingTimeout();
 
-      await updateProgressApiFallback();
-      flushDeferredCompletionIfSafe();
-
-      // If Generate was clicked but no generation request/progress was captured,
-      // reset the pending state. Do not notify: this is probably validation failure or UI-only activity.
-      if (!activeNetworkGeneration && pendingCaptureStartedAt > 0 && now - pendingCaptureStartedAt > PENDING_CAPTURE_TIMEOUT_MS) {
-        console.warn(`[${EXT_NAME}] generation capture timed out`);
-        resetGenerationTracking();
-        generationStartTime = null;
-      }
-
-      updateElapsedLabel(activeNetworkGeneration || pendingCaptureStartedAt > 0);
+      updateElapsedLabel(state !== STATE_IDLE);
       updateButtonState();
       updateSoundButtonState();
     } catch (e) {
@@ -1051,9 +1492,10 @@
 
   function init() {
     installNetworkHooks();
+    installNotificationBridge();
     createFloatingButton();
     setInterval(loop, CHECK_INTERVAL_MS);
-    console.log(`[${EXT_NAME}] loaded`);
+    log("loaded");
   }
 
   if (document.readyState === "loading") {
