@@ -9,14 +9,14 @@ Instead, it monitors the generation state independently and sends its own notifi
 
 ## Features
 
-* Displays a notification panel in the bottom-right corner
-* Provides notification permission and test buttons
-* Allows notification sound to be turned ON / OFF
-* Shows a browser notification when generation is complete
-* Plays a notification sound when enabled
-* Displays the generation time in the notification
-* Shows the elapsed generation time in the panel
-* Detects the generation state using the progress bar and stop button
+- Displays a notification panel in the bottom-right corner
+- Provides notification permission and test notification buttons
+- Allows notification sound to be turned ON / OFF
+- Shows a browser notification when image generation is complete
+- Plays a notification sound when enabled
+- Displays the generation time in the notification
+- Shows the elapsed generation time in the panel while generating
+- Detects completion using Gradio queue / progress state
 
 ---
 
@@ -25,7 +25,7 @@ Instead, it monitors the generation state independently and sends its own notifi
 1. Place this folder inside Forge Neo's `extensions` folder.
 2. Restart Forge Neo.
 3. Open Forge Neo in your browser.
-4. Click `Enable notifications` in the bottom-right panel.
+4. Click `Enable notifications` in the notification panel at the bottom right.
 5. If the test notification appears, setup is complete.
 
 ---
@@ -35,7 +35,7 @@ Instead, it monitors the generation state independently and sends its own notifi
 This extension sends a notification when the following state change is detected:
 
 ```text
-Generating → Not generating
+Generating -> Not generating
 ```
 
 Since v1.1.2, completion detection is based on Gradio queue / progress state instead of DOM or gallery updates.
@@ -100,7 +100,7 @@ http://127.0.0.1:7860,http://localhost:7860,http://192.168.x.x:7860
 
 Restart Edge after changing the setting.
 
-### Brave or other Chromium-based browsers
+### Brave or other Chromium-based browsers using launch options
 
 You can also add a launch option to the browser shortcut.
 
@@ -116,12 +116,12 @@ Replace `192.168.x.x` with the IP address used in your own environment.
 
 ## Button Labels
 
-* `Enable notifications`: Notifications have not been allowed yet
-* `Test notification`: Notifications are allowed
-* `Sound: ON / OFF`: Toggles notification sound
-* `Allow in browser settings`: Notifications are blocked by the browser
-* `HTTPS/localhost required`: The page is not treated as a secure context
-* `Not supported`: Browser notifications are not supported
+- `Enable notifications`: Notifications have not been allowed yet
+- `Test notification`: Notifications are allowed
+- `Sound: ON / OFF`: Toggles notification sound
+- `Allow in browser settings`: Notifications are blocked by the browser
+- `HTTPS/localhost required`: The page is not treated as a secure context
+- `Not supported`: Browser notifications are not supported
 
 ---
 
@@ -131,18 +131,18 @@ Replace `192.168.x.x` with the IP address used in your own environment.
 
 Check the following:
 
-* Make sure you are accessing Forge Neo via `localhost`
-* Check browser notification permissions
-* Check OS notification settings
-* If using LAN access, make sure the URL is treated as a secure origin
+- Make sure you are accessing Forge Neo via `localhost`
+- Check browser notification permissions
+- Check OS notification settings
+- If using LAN access, make sure the target URL is treated as a secure origin
 
 ### Notification sound does not play
 
 Check the following:
 
-* Make sure `Sound` is set to `ON`
-* Make sure the browser or OS audio is not muted
-* Try pressing the test notification button once
+- Make sure `Sound` is set to `ON`
+- Make sure the browser or OS audio is not muted
+- Try pressing the test notification button once
 
 Some browsers may block audio playback until the user interacts with the page.
 
@@ -150,18 +150,26 @@ Some browsers may block audio playback until the user interacts with the page.
 
 ## Version History
 
+### v1.1.3
+
+- Fixed an issue where opening the image preview during generation could be incorrectly detected as generation completion
+- Reduced false completion notifications that could occur when interacting with tabs such as `txt2img` / `img2img` during generation
+- Gradio queue `process_completed` is now judged with priority given to the captured `event_id`
+- Improved handling so normal generation completion is less likely to be missed even when `event_id` cannot be obtained in some environments
+- Added a short confirmation step using the progress API and stop button state immediately before sending the completion notification
+
 ### v1.1.2
 
-* Fixed an issue where changing Checkpoint / LoRA tabs in Forge Neo could be incorrectly detected as generation completion
-* Changed completion detection to use Gradio queue / progress state instead of DOM or gallery updates
+- Fixed an issue where changing Checkpoint / LoRA tabs in Forge Neo could be incorrectly detected as generation completion
+- Changed completion detection to use Gradio queue / progress state instead of DOM or gallery updates
 
 ### v1.1.1
 
-* Reduced false completion detections
+- Reduced false completion detections
 
 ### v1.1.0
 
-* Initial release
+- Initial release
 
 ---
 
