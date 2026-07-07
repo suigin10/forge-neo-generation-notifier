@@ -15,7 +15,7 @@ Forge Neo 本体の `Request Browser Notification` 機能には依存せず、�
 - 通知音の再生（ON 時）
 - 通知に生成時間を表示
 - 生成中の経過時間をパネルに表示
-- Gradio の queue / progress 状態を使って生成完了を検出
+- Gradio の queue / progress 状態、progress API、UI 状態を使って生成完了を検出
 
 ---
 
@@ -37,7 +37,9 @@ Forge Neo 本体の `Request Browser Notification` 機能には依存せず、�
 生成中 → 非生成状態
 ```
 
-v1.1.2 以降では、DOM やギャラリー更新ではなく、Gradio の queue / progress 状態を使って生成完了を判定します。
+完了判定には、Gradio の queue / progress 状態、progress API、Generate / Interrupt ボタンなどの UI 状態を利用します。
+
+画像プレビュー操作やタブ切り替えなど、生成完了ではない UI 変化による誤通知を抑えるようにしています。
 
 ---
 
@@ -149,18 +151,24 @@ Brave の例：
 
 ## バージョン履歴
 
+### v1.1.4
+
+- Generate / Interrupt / 再生成の連続操作時の安定性を改善
+- 信頼できる Gradio queue 完了イベントは、UI ガード中でも生成完了として確定するよう改善
+- UI 操作中の古い queue 完了イベントや無関係な完了イベントをより安全に無視
+- Forge Neo / Gradio 側のブラウザ通知を、完了判定の補助シグナルとして利用
+
 ### v1.1.3
 
 - 生成中に画像プレビューを開いた際、生成完了と誤検出される問題を修正
-- 生成中に `txt2img` / `img2img` などのタブを操作した際、完了通知が誤って出る場合がある問題を軽減
-- Gradio queue の `process_completed` は、捕捉済みの `event_id` を優先して判定
-- 一部環境で `event_id` が取得できない場合でも、正規の生成完了を取りこぼしにくいよう調整
-- 完了通知の直前に progress API と停止ボタンの状態を短時間確認するよう変更
+- `txt2img` / `img2img` などのタブ操作による誤通知を軽減
+- Gradio queue の `event_id` と短時間の progress 確認を使って完了判定を改善
 
 ### v1.1.2
 
-- Forge Neo で Checkpoint / LoRA タブを操作した際、生成完了と誤検出される問題を修正
-- DOM やギャラリー更新ではなく、Gradio の queue / progress 状態を使って生成完了を判定するよう変更
+- Checkpoint / LoRA タブ操作時の生成完了誤検出を修正
+- DOM やギャラリー更新ではなく、Gradio queue / progress 状態を使う方式に変更
+- 生成中の UI 操作による誤判定を軽減
 
 ### v1.1.1
 
