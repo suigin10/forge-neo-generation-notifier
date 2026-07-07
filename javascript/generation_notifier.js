@@ -20,12 +20,26 @@
   const GENERATE_CAPTURE_WINDOW_MS = 10000;
   const PENDING_CAPTURE_TIMEOUT_MS = 20000;
   const PROGRESS_API_RETRY_MS = 15000;
-  const PROGRESS_FINISH_CONFIRM_LOOPS = 3;
+  const PROGRESS_FINISH_CONFIRM_LOOPS = 2;
+
+  // Image preview/lightbox guard:
+  // Opening an image preview or switching tabs during generation can make Gradio emit
+  // UI-only queue/progress changes. Do not notify while those guards are active.
+  const IMAGE_PREVIEW_GUARD_MS = 4500;
+  const IMAGE_PREVIEW_MODAL_CLOSE_GUARD_MS = 2500;
+  const UI_INTERACTION_GUARD_MS = 3500;
+  const QUEUE_COMPLETION_CONFIRM_DELAY_MS = 800;
+  const DEFERRED_COMPLETION_FALLBACK_MS = 2000;
 
   let wasGenerating = false;
   let startupSyncCount = 0;
   let lastNotify = 0;
   let lastVisibilityChange = 0;
+  let lastImagePreviewInteraction = 0;
+  let lastImagePreviewModalSeenAt = 0;
+  let lastUiInteractionDuringGeneration = 0;
+  let deferredCompletionReason = "";
+  let deferredCompletionAt = 0;
   let generationStartTime = null;
   let generationCaptureUntil = 0;
   let pendingCaptureStartedAt = 0;
@@ -326,6 +340,8 @@
     activeNetworkGeneration = false;
     seenProgressApiActive = false;
     progressApiInactiveLoops = 0;
+    deferredCompletionReason = "";
+    deferredCompletionAt = 0;
   }
 
   function isGenerateButtonTarget(target) {
@@ -342,6 +358,171 @@
       !/interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
   }
 
+  function isImagePreviewTarget(target) {
+    if (!target?.closest || target.closest("#generation-notifier-panel")) return false;
+
+    let el = target.closest("img, canvas");
+
+    if (!el) {
+      const container = target.closest([
+        '[class*="gallery"]',
+        '[class*="Gallery"]',
+        '[class*="image"]',
+        '[class*="Image"]',
+        '[data-testid*="gallery"]',
+        '[data-testid*="image"]'
+      ].join(","));
+
+      if (container && !container.closest("#generation-notifier-panel")) {
+        el = container.querySelector("img, canvas") || container;
+      }
+    }
+
+    if (!el) return false;
+
+    const rect = el.getBoundingClientRect();
+
+    // Avoid tiny icons. Generated images/previews are usually much larger.
+    return rect.width >= 24 && rect.height >= 24;
+  }
+
+  function armImagePreviewGuard() {
+    lastImagePreviewInteraction = Date.now();
+    console.log(`[${EXT_NAME}] image preview guard armed`);
+  }
+
+  function armUiInteractionGuard(reason) {
+    if (!activeNetworkGeneration && !pendingCaptureStartedAt && !wasGenerating) return;
+
+    lastUiInteractionDuringGeneration = Date.now();
+    console.log(`[${EXT_NAME}] UI interaction guard armed: ${reason}`);
+  }
+
+  function isGenerationTabTarget(target) {
+    if (!target?.closest || target.closest("#generation-notifier-panel")) return false;
+
+    const tab = target.closest('button, [role="tab"], .tabitem, .tabs button, label, a');
+    if (!tab || tab.closest("#generation-notifier-panel")) return false;
+
+    const text = [
+      tab.textContent || "",
+      tab.getAttribute?.("aria-label") || "",
+      tab.getAttribute?.("title") || "",
+      tab.id || ""
+    ].join(" ").trim();
+
+    return /txt2img|img2img|extras|png info|settings|extensions|checkpoint|lora|textual inversion|hypernetworks|テキスト|画像|設定|拡張|チェックポイント/i.test(text);
+  }
+
+  function looksGeneratingFromDom() {
+    const buttons = Array.from(document.querySelectorAll("button"));
+
+    return buttons.some((b) => {
+      if (!isVisible(b) || b.disabled) return false;
+      if (b.closest("#generation-notifier-panel")) return false;
+
+      const text = [
+        b.textContent || "",
+        b.getAttribute?.("aria-label") || "",
+        b.getAttribute?.("title") || "",
+        b.id || ""
+      ].join(" ");
+
+      return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
+    });
+  }
+
+  function elementLooksVisible(el) {
+    if (!el || !(el instanceof Element)) return false;
+
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      return false;
+    }
+
+    const rect = el.getBoundingClientRect();
+    return rect.width >= 120 && rect.height >= 120;
+  }
+
+  function isImagePreviewModalOpen() {
+    const selectors = [
+      "#lightboxModal",
+      "#modalImage",
+      ".lightboxModal",
+      ".lightbox",
+      ".gradio-modal",
+      ".modal",
+      ".modal-container",
+      ".image-preview",
+      ".fullscreen",
+      '[role="dialog"]',
+      '[class*="lightbox"]',
+      '[class*="Lightbox"]',
+      '[class*="modal"]',
+      '[class*="Modal"]',
+      '[class*="preview"]',
+      '[class*="Preview"]',
+      '[class*="fullscreen"]',
+      '[class*="Fullscreen"]'
+    ];
+
+    const candidates = document.querySelectorAll(selectors.join(","));
+
+    for (const el of candidates) {
+      if (!elementLooksVisible(el)) continue;
+
+      const rect = el.getBoundingClientRect();
+      const hasLargeMedia = Array.from(el.querySelectorAll("img, canvas")).some((media) => {
+        const mediaRect = media.getBoundingClientRect();
+        return mediaRect.width >= 120 && mediaRect.height >= 120;
+      });
+
+      const coversViewport = rect.width >= window.innerWidth * 0.35 &&
+        rect.height >= window.innerHeight * 0.35;
+
+      if (hasLargeMedia && coversViewport) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isImagePreviewGuardActive() {
+    const now = Date.now();
+
+    if (isImagePreviewModalOpen()) {
+      lastImagePreviewModalSeenAt = now;
+      return true;
+    }
+
+    return now - lastImagePreviewInteraction < IMAGE_PREVIEW_GUARD_MS ||
+      now - lastImagePreviewModalSeenAt < IMAGE_PREVIEW_MODAL_CLOSE_GUARD_MS;
+  }
+
+  function isCompletionGuardActive() {
+    const now = Date.now();
+    const visibilityGuardActive = now - lastVisibilityChange < VISIBILITY_GUARD_MS;
+    const previewGuardActive = isImagePreviewGuardActive();
+    const uiInteractionGuardActive = now - lastUiInteractionDuringGeneration < UI_INTERACTION_GUARD_MS;
+
+    return visibilityGuardActive || previewGuardActive || uiInteractionGuardActive;
+  }
+
+  function deferCompletion(reason) {
+    deferredCompletionReason = reason;
+    deferredCompletionAt = Date.now();
+    console.log(`[${EXT_NAME}] deferred completion via ${reason} while UI guard is active`);
+  }
+
+  function clearDeferredCompletion(reason) {
+    if (!deferredCompletionReason) return;
+
+    console.log(`[${EXT_NAME}] cleared deferred completion via ${reason}`);
+    deferredCompletionReason = "";
+    deferredCompletionAt = 0;
+  }
+
   function armGenerationCapture() {
     // Prepare for a fresh generation attempt.
     resetGenerationTracking();
@@ -353,9 +534,28 @@
     updateElapsedLabel(true);
   }
 
+  document.addEventListener("pointerdown", (event) => {
+    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isImagePreviewTarget(event.target)) {
+      armImagePreviewGuard();
+    }
+
+    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isGenerationTabTarget(event.target)) {
+      armUiInteractionGuard("tab/panel interaction");
+    }
+  }, true);
+
   document.addEventListener("click", (event) => {
     if (isGenerateButtonTarget(event.target)) {
       armGenerationCapture();
+      return;
+    }
+
+    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isImagePreviewTarget(event.target)) {
+      armImagePreviewGuard();
+    }
+
+    if ((activeNetworkGeneration || pendingCaptureStartedAt > 0 || wasGenerating) && isGenerationTabTarget(event.target)) {
+      armUiInteractionGuard("tab/panel interaction");
     }
   }, true);
 
@@ -380,6 +580,7 @@
       generationStartTime = Date.now();
     }
 
+    clearDeferredCompletion(`generation still active (${reason})`);
     pendingCaptureStartedAt = 0;
     activeNetworkGeneration = true;
     wasGenerating = true;
@@ -388,8 +589,22 @@
     updateElapsedLabel(true);
   }
 
-  function completeNetworkGeneration(reason) {
+  function completeNetworkGeneration(reason, options = {}) {
     if (!activeNetworkGeneration && !wasGenerating) return;
+
+    // Even strong queue/progress evidence should not fire a Windows/browser notification
+    // while the user is opening image preview, switching txt2img/img2img tabs, or while
+    // the page has just changed visibility. Defer instead of dropping the completion.
+    if (!options.ignoreUiGuard && isCompletionGuardActive()) {
+      deferCompletion(reason);
+      return;
+    }
+
+    if (!options.ignoreDomCheck && looksGeneratingFromDom()) {
+      clearDeferredCompletion("DOM still looks generating");
+      progressApiInactiveLoops = 0;
+      return;
+    }
 
     console.log(`[${EXT_NAME}] generation completed via ${reason}`);
 
@@ -397,6 +612,71 @@
     notifyDone();
     wasGenerating = false;
     updateElapsedLabel(false);
+  }
+
+  function flushDeferredCompletionIfSafe() {
+    if (!deferredCompletionReason || (!activeNetworkGeneration && !wasGenerating)) return;
+
+    if (isCompletionGuardActive()) return;
+
+    const deferredAge = Date.now() - deferredCompletionAt;
+
+    if (looksGeneratingFromDom()) {
+      clearDeferredCompletion("DOM still looks generating");
+      progressApiInactiveLoops = 0;
+      return;
+    }
+
+    // If the progress API has ever confirmed activity, require it to confirm inactivity too.
+    if (seenProgressApiActive && progressApiInactiveLoops < PROGRESS_FINISH_CONFIRM_LOOPS) {
+      return;
+    }
+
+    // If progress API was not available, do not wait forever.
+    // A matched queue completion is stronger evidence than UI state, so flush after a short guard delay.
+    if (!seenProgressApiActive && deferredAge < DEFERRED_COMPLETION_FALLBACK_MS) {
+      return;
+    }
+
+    const reason = deferredCompletionReason;
+    completeNetworkGeneration(`deferred ${reason}`, { ignoreUiGuard: true });
+  }
+
+  function confirmQueueCompletion(reason) {
+    const generationToken = generationStartTime || Date.now();
+
+    window.setTimeout(async () => {
+      if (!activeNetworkGeneration && !wasGenerating) return;
+      if (generationStartTime && generationStartTime !== generationToken) return;
+
+      if (looksGeneratingFromDom()) {
+        console.log(`[${EXT_NAME}] ignored queue completion because DOM still looks generating`);
+        return;
+      }
+
+      const apiGenerating = await getProgressApiGeneratingState();
+
+      if (apiGenerating === true) {
+        console.log(`[${EXT_NAME}] ignored queue completion because progress API is still active`);
+        seenProgressApiActive = true;
+        progressApiInactiveLoops = 0;
+        clearDeferredCompletion("progress API still active after queue completion");
+        return;
+      }
+
+      if (apiGenerating === false) {
+        if (seenProgressApiActive) {
+          progressApiInactiveLoops = PROGRESS_FINISH_CONFIRM_LOOPS;
+        }
+
+        completeNetworkGeneration(reason);
+        return;
+      }
+
+      // Progress API may be unavailable when --api is not enabled or blocked.
+      // In that case, trust the queue completion, but still respect UI guards.
+      completeNetworkGeneration(reason);
+    }, QUEUE_COMPLETION_CONFIRM_DELAY_MS);
   }
 
   function captureQueueEventId(eventId) {
@@ -432,7 +712,8 @@
     if (!eventId && !msg) return;
 
     // If queue/join response was missed, capture only real running events.
-    // Never capture process_completed by itself because it might belong to an old event.
+    // Never capture process_completed by itself because it might belong to an old event
+    // or an unrelated image preview/lightbox interaction.
     if (
       eventId &&
       activeQueueEventIds.size === 0 &&
@@ -447,12 +728,27 @@
     }
 
     if (/process_starts|process_generating/.test(msg)) {
+      clearDeferredCompletion(`queue ${msg}`);
       beginNetworkGeneration(`queue ${msg}`);
       return;
     }
 
-    if (msg === "process_completed" && (activeQueueEventIds.size > 0 || activeNetworkGeneration)) {
-      completeNetworkGeneration(`queue ${eventId || "unknown event"}`);
+    if (msg === "process_completed") {
+      // v1.1.3 fix:
+      // Prefer a captured Gradio event_id when it exists, but do not require it.
+      // Some Forge/Gradio builds may deliver process_completed without an event_id; dropping
+      // that message can miss a legitimate generation finish. Mismatched event_id is still ignored.
+      if (eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId)) {
+        if (activeNetworkGeneration && isCompletionGuardActive()) {
+          console.log(`[${EXT_NAME}] ignored unrelated queue completion during UI guard`);
+        }
+        return;
+      }
+
+      if (!activeNetworkGeneration && !wasGenerating) return;
+
+      const label = eventId ? `queue ${eventId}` : "queue process_completed";
+      confirmQueueCompletion(label);
     }
   }
 
@@ -560,6 +856,7 @@
     if (apiGenerating === true) {
       seenProgressApiActive = true;
       progressApiInactiveLoops = 0;
+      clearDeferredCompletion("progress API still active");
 
       if (!activeNetworkGeneration) {
         beginNetworkGeneration("progress API");
@@ -569,6 +866,12 @@
     }
 
     if (apiGenerating === false && activeNetworkGeneration && seenProgressApiActive) {
+      if (looksGeneratingFromDom()) {
+        progressApiInactiveLoops = 0;
+        clearDeferredCompletion("DOM still looks generating after progress API false");
+        return;
+      }
+
       progressApiInactiveLoops += 1;
 
       if (progressApiInactiveLoops >= PROGRESS_FINISH_CONFIRM_LOOPS) {
@@ -726,6 +1029,7 @@
       }
 
       await updateProgressApiFallback();
+      flushDeferredCompletionIfSafe();
 
       // If Generate was clicked but no generation request/progress was captured,
       // reset the pending state. Do not notify: this is probably validation failure or UI-only activity.
