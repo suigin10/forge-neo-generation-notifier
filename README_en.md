@@ -16,7 +16,7 @@ Instead, it monitors the generation state independently and sends its own notifi
 - Plays a notification sound when enabled
 - Displays the generation time in the notification
 - Shows the elapsed generation time in the panel while generating
-- Detects completion using Gradio queue / progress state
+- Detects completion using Gradio queue / progress state, progress API, and UI state
 
 ---
 
@@ -38,7 +38,9 @@ This extension sends a notification when the following state change is detected:
 Generating -> Not generating
 ```
 
-Since v1.1.2, completion detection is based on Gradio queue / progress state instead of DOM or gallery updates.
+Completion detection is based on Gradio queue / progress state, the progress API, and UI state such as the Generate / Interrupt buttons.
+
+The extension also ignores common UI-only changes, such as image preview operations and tab switching, to reduce false completion notifications.
 
 ---
 
@@ -150,26 +152,32 @@ Some browsers may block audio playback until the user interacts with the page.
 
 ## Version History
 
+### v1.1.4
+
+- Improved stability during rapid Generate / Interrupt / restart operations.
+- Trusted Gradio queue completion events can now finalize generation even while UI guards are active.
+- Stale or unrelated queue completion events are ignored more safely during UI operations.
+- Forge Neo / Gradio native browser notifications are used as a fallback completion signal.
+
 ### v1.1.3
 
-- Fixed an issue where opening the image preview during generation could be incorrectly detected as generation completion
-- Reduced false completion notifications that could occur when interacting with tabs such as `txt2img` / `img2img` during generation
-- Gradio queue `process_completed` is now judged with priority given to the captured `event_id`
-- Improved handling so normal generation completion is less likely to be missed even when `event_id` cannot be obtained in some environments
-- Added a short confirmation step using the progress API and stop button state immediately before sending the completion notification
+- Fixed false completion detections caused by opening the image preview during generation.
+- Reduced false notifications when interacting with tabs such as `txt2img` / `img2img`.
+- Improved completion detection using Gradio queue `event_id` and short progress confirmation.
 
 ### v1.1.2
 
-- Fixed an issue where changing Checkpoint / LoRA tabs in Forge Neo could be incorrectly detected as generation completion
-- Changed completion detection to use Gradio queue / progress state instead of DOM or gallery updates
+- Fixed false completion detections caused by changing Checkpoint / LoRA tabs.
+- Switched completion detection from DOM / gallery updates to Gradio queue / progress state.
+- Improved stability against UI-only changes during generation.
 
 ### v1.1.1
 
-- Reduced false completion detections
+- Reduced false completion detections.
 
 ### v1.1.0
 
-- Initial release
+- Initial release.
 
 ---
 
