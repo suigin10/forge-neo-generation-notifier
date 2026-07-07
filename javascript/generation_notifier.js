@@ -12,11 +12,30 @@
   // This prevents duplicate notifications caused by Brave/Chrome re-evaluating the page state.
   const VISIBILITY_GUARD_MS = 3000;
 
+  // Network/progress mode:
+  // DOM and gallery changes are too noisy in Forge Neo.
+  // Do not notify on /queue/join or /run/predict responses.
+  // Notify only on Gradio queue process_completed, or on progress API becoming inactive
+  // after it was observed active for this generation.
+  const GENERATE_CAPTURE_WINDOW_MS = 10000;
+  const PENDING_CAPTURE_TIMEOUT_MS = 20000;
+  const PROGRESS_API_RETRY_MS = 15000;
+  const PROGRESS_FINISH_CONFIRM_LOOPS = 3;
+
   let wasGenerating = false;
   let startupSyncCount = 0;
   let lastNotify = 0;
   let lastVisibilityChange = 0;
   let generationStartTime = null;
+  let generationCaptureUntil = 0;
+  let pendingCaptureStartedAt = 0;
+  let activeQueueEventIds = new Set();
+  let activeNetworkGeneration = false;
+  let seenProgressApiActive = false;
+  let progressApiInactiveLoops = 0;
+  let progressApiBackoffUntil = 0;
+  let networkHooksInstalled = false;
+  let loopBusy = false;
   let button = null;
   let soundButton = null;
   let statusLabel = null;
@@ -300,41 +319,392 @@
     return style.display !== "none" && style.visibility !== "hidden" && el.offsetParent !== null;
   }
 
+  function resetGenerationTracking() {
+    generationCaptureUntil = 0;
+    pendingCaptureStartedAt = 0;
+    activeQueueEventIds.clear();
+    activeNetworkGeneration = false;
+    seenProgressApiActive = false;
+    progressApiInactiveLoops = 0;
+  }
+
+  function isGenerateButtonTarget(target) {
+    const b = target?.closest?.("button");
+    if (!b || b.closest("#generation-notifier-panel")) return false;
+
+    if (b.id === "txt2img_generate" || b.id === "img2img_generate") {
+      return true;
+    }
+
+    const text = (b.textContent || "").trim();
+
+    return /generate|生成/i.test(text) &&
+      !/interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text);
+  }
+
+  function armGenerationCapture() {
+    // Prepare for a fresh generation attempt.
+    resetGenerationTracking();
+    generationCaptureUntil = Date.now() + GENERATE_CAPTURE_WINDOW_MS;
+    pendingCaptureStartedAt = Date.now();
+    generationStartTime = Date.now();
+
+    console.log(`[${EXT_NAME}] armed generation capture`);
+    updateElapsedLabel(true);
+  }
+
+  document.addEventListener("click", (event) => {
+    if (isGenerateButtonTarget(event.target)) {
+      armGenerationCapture();
+    }
+  }, true);
+
+  function getRequestUrl(input) {
+    try {
+      if (typeof input === "string") return input;
+      if (input instanceof URL) return input.toString();
+      if (input && typeof input.url === "string") return input.url;
+    } catch (e) {
+      console.warn(`[${EXT_NAME}] failed to read request URL`, e);
+    }
+
+    return "";
+  }
+
+  function isArmedForGenerationCapture() {
+    return Date.now() <= generationCaptureUntil;
+  }
+
+  function beginNetworkGeneration(reason) {
+    if (!generationStartTime) {
+      generationStartTime = Date.now();
+    }
+
+    pendingCaptureStartedAt = 0;
+    activeNetworkGeneration = true;
+    wasGenerating = true;
+
+    console.log(`[${EXT_NAME}] generation started via ${reason}`);
+    updateElapsedLabel(true);
+  }
+
+  function completeNetworkGeneration(reason) {
+    if (!activeNetworkGeneration && !wasGenerating) return;
+
+    console.log(`[${EXT_NAME}] generation completed via ${reason}`);
+
+    resetGenerationTracking();
+    notifyDone();
+    wasGenerating = false;
+    updateElapsedLabel(false);
+  }
+
+  function captureQueueEventId(eventId) {
+    if (!eventId) return;
+
+    const id = String(eventId);
+    activeQueueEventIds.add(id);
+    beginNetworkGeneration(`queue event ${id}`);
+  }
+
+  function isQueueJoinUrl(url) {
+    return /\/queue\/join(?:\?|$)/.test(url);
+  }
+
+  function isQueueDataUrl(url) {
+    return /\/queue\/data(?:\?|$)/.test(url);
+  }
+
+  function isPredictUrl(url) {
+    return /\/run\/predict(?:\?|$)|\/api\/predict(?:\?|$)/.test(url);
+  }
+
+  function shouldCaptureQueueJoin(url) {
+    return isArmedForGenerationCapture() && isQueueJoinUrl(url);
+  }
+
+  function handleQueuePayload(payload) {
+    if (!payload || typeof payload !== "object") return;
+
+    const eventId = payload.event_id ? String(payload.event_id) : "";
+    const msg = String(payload.msg || "");
+
+    if (!eventId && !msg) return;
+
+    // If queue/join response was missed, capture only real running events.
+    // Never capture process_completed by itself because it might belong to an old event.
+    if (
+      eventId &&
+      activeQueueEventIds.size === 0 &&
+      (activeNetworkGeneration || isArmedForGenerationCapture()) &&
+      /process_starts|process_generating/.test(msg)
+    ) {
+      captureQueueEventId(eventId);
+    }
+
+    if (eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId)) {
+      return;
+    }
+
+    if (/process_starts|process_generating/.test(msg)) {
+      beginNetworkGeneration(`queue ${msg}`);
+      return;
+    }
+
+    if (msg === "process_completed" && (activeQueueEventIds.size > 0 || activeNetworkGeneration)) {
+      completeNetworkGeneration(`queue ${eventId || "unknown event"}`);
+    }
+  }
+
+  function handleQueueMessageData(rawData) {
+    if (!rawData || (!activeNetworkGeneration && !isArmedForGenerationCapture())) return;
+
+    try {
+      handleQueuePayload(JSON.parse(String(rawData)));
+    } catch {
+      // Ignore non-JSON queue messages.
+    }
+  }
+
+  function handleSseBlock(block) {
+    const dataLines = String(block)
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim());
+
+    if (dataLines.length <= 0) return;
+
+    handleQueueMessageData(dataLines.join("\n"));
+  }
+
+  async function readQueueDataStream(response) {
+    try {
+      if (!response?.body?.getReader) {
+        const text = await response.text();
+        text.split(/\r?\n\r?\n/).forEach(handleSseBlock);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || "";
+
+        blocks.forEach(handleSseBlock);
+      }
+
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        handleSseBlock(buffer);
+      }
+    } catch (e) {
+      console.warn(`[${EXT_NAME}] failed to read queue/data stream`, e);
+    }
+  }
+
+  async function getProgressApiGeneratingState() {
+    const now = Date.now();
+
+    if (now < progressApiBackoffUntil) return null;
+
+    try {
+      const url = new URL("/sdapi/v1/progress", window.location.origin);
+      url.searchParams.set("skip_current_image", "true");
+
+      const res = await fetch(url.toString(), {
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+
+      if (!res.ok) {
+        progressApiBackoffUntil = now + PROGRESS_API_RETRY_MS;
+        return null;
+      }
+
+      const data = await res.json();
+      const state = data?.state || {};
+
+      const jobCount = Number(state.job_count || 0);
+      const samplingStep = Number(state.sampling_step || 0);
+      const samplingSteps = Number(state.sampling_steps || 0);
+      const progress = Number(data?.progress || 0);
+      const jobText = String(state.job || "").trim();
+
+      return (
+        jobCount > 0 ||
+        (progress > 0 && progress < 1) ||
+        (samplingSteps > 0 && samplingStep < samplingSteps) ||
+        (jobText.length > 0 && progress < 1)
+      );
+    } catch (e) {
+      progressApiBackoffUntil = now + PROGRESS_API_RETRY_MS;
+      console.warn(`[${EXT_NAME}] progress API unavailable`, e);
+      return null;
+    }
+  }
+
+  async function updateProgressApiFallback() {
+    if (!activeNetworkGeneration && !pendingCaptureStartedAt && !isArmedForGenerationCapture()) return;
+
+    const apiGenerating = await getProgressApiGeneratingState();
+
+    if (apiGenerating === true) {
+      seenProgressApiActive = true;
+      progressApiInactiveLoops = 0;
+
+      if (!activeNetworkGeneration) {
+        beginNetworkGeneration("progress API");
+      }
+
+      return;
+    }
+
+    if (apiGenerating === false && activeNetworkGeneration && seenProgressApiActive) {
+      progressApiInactiveLoops += 1;
+
+      if (progressApiInactiveLoops >= PROGRESS_FINISH_CONFIRM_LOOPS) {
+        completeNetworkGeneration("progress API");
+      }
+
+      return;
+    }
+
+    if (apiGenerating === false) {
+      progressApiInactiveLoops = 0;
+    }
+  }
+
+  function installNetworkHooks() {
+    if (networkHooksInstalled) return;
+    networkHooksInstalled = true;
+
+    const nativeFetch = window.fetch?.bind(window);
+
+    if (nativeFetch) {
+      window.fetch = async function(input, init) {
+        const url = getRequestUrl(input);
+        const captureQueueJoin = shouldCaptureQueueJoin(url);
+        const queueData = isQueueDataUrl(url);
+        const predictDuringCapture = isArmedForGenerationCapture() && isPredictUrl(url);
+
+        let response;
+
+        try {
+          response = await nativeFetch(input, init);
+        } catch (e) {
+          if (captureQueueJoin || predictDuringCapture) {
+            console.warn(`[${EXT_NAME}] captured generation request failed`, e);
+          }
+
+          throw e;
+        }
+
+        if (queueData) {
+          readQueueDataStream(response.clone());
+        }
+
+        if (captureQueueJoin) {
+          beginNetworkGeneration("queue/join");
+
+          response.clone().json().then((data) => {
+            captureQueueEventId(data?.event_id || data?.eventId);
+          }).catch((e) => {
+            console.warn(`[${EXT_NAME}] failed to parse queue/join response`, e);
+          });
+        }
+
+        if (predictDuringCapture) {
+          // Important:
+          // Do NOT complete on /run/predict or /api/predict.
+          // In Forge/Gradio this can be only an initial/auxiliary request.
+          console.log(`[${EXT_NAME}] predict request observed; waiting for queue completion or progress API finish`);
+        }
+
+        return response;
+      };
+    }
+
+    const NativeEventSource = window.EventSource;
+
+    if (NativeEventSource) {
+      const WrappedEventSource = function(url, config) {
+        const es = new NativeEventSource(url, config);
+
+        try {
+          if (isQueueDataUrl(String(url || ""))) {
+            es.addEventListener("message", (event) => {
+              handleQueueMessageData(event.data);
+            });
+          }
+        } catch (e) {
+          console.warn(`[${EXT_NAME}] failed to attach queue/data listener`, e);
+        }
+
+        return es;
+      };
+
+      WrappedEventSource.prototype = NativeEventSource.prototype;
+      WrappedEventSource.CONNECTING = NativeEventSource.CONNECTING;
+      WrappedEventSource.OPEN = NativeEventSource.OPEN;
+      WrappedEventSource.CLOSED = NativeEventSource.CLOSED;
+
+      window.EventSource = WrappedEventSource;
+    }
+
+    const NativeWebSocket = window.WebSocket;
+
+    if (NativeWebSocket) {
+      const WrappedWebSocket = function(url, protocols) {
+        const ws = protocols === undefined
+          ? new NativeWebSocket(url)
+          : new NativeWebSocket(url, protocols);
+
+        try {
+          const urlText = String(url || "");
+
+          if (/queue|predict/.test(urlText)) {
+            ws.addEventListener("message", (event) => {
+              handleQueueMessageData(event.data);
+            });
+          }
+        } catch (e) {
+          console.warn(`[${EXT_NAME}] failed to attach websocket listener`, e);
+        }
+
+        return ws;
+      };
+
+      WrappedWebSocket.prototype = NativeWebSocket.prototype;
+      WrappedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+      WrappedWebSocket.OPEN = NativeWebSocket.OPEN;
+      WrappedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+      WrappedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+
+      window.WebSocket = WrappedWebSocket;
+    }
+
+    console.log(`[${EXT_NAME}] network hooks installed`);
+  }
+
   function isGenerating() {
-    const progressCandidates = [
-      "#progressbar",
-      ".progressDiv",
-      ".progress",
-    ];
-
-    const hasVisibleProgress = progressCandidates.some((selector) => {
-      return [...document.querySelectorAll(selector)].some(isVisible);
-    });
-
-    const hasActiveStopButton = [...document.querySelectorAll("button")].some((b) => {
-      const text = (b.textContent || "").trim();
-
-      return /interrupt|skip|stop|cancel|中断|スキップ|停止|キャンセル/i.test(text) && !b.disabled && isVisible(b);
-    });
-
-    // Treat it as generating only when both a real progress element and an active stop/control button are visible.
-    return hasVisibleProgress && hasActiveStopButton;
+    return activeNetworkGeneration;
   }
 
   function syncStartupState(generating) {
     if (startupSyncCount >= STARTUP_SYNC_LOOPS) return false;
 
     startupSyncCount += 1;
-    wasGenerating = generating;
 
-    if (generating && !generationStartTime) {
-      generationStartTime = Date.now();
-    }
-
-    if (!generating) {
-      generationStartTime = null;
-    }
-
+    // Network/progress mode should not infer startup generation state from the DOM.
     updateElapsedLabel(generating);
     updateButtonState();
     updateSoundButtonState();
@@ -342,7 +712,11 @@
     return true;
   }
 
-  function loop() {
+  async function loop() {
+    if (loopBusy) return;
+
+    loopBusy = true;
+
     try {
       const generating = isGenerating();
       const now = Date.now();
@@ -351,32 +725,28 @@
         return;
       }
 
-      if (!wasGenerating && generating) {
-        generationStartTime = Date.now();
-      }
+      await updateProgressApiFallback();
 
-      if (wasGenerating && !generating) {
-        // Do not notify immediately after tab switching.
-        // Keep generationStartTime intact here so the real finish notification still has duration.
-        if (now - lastVisibilityChange >= VISIBILITY_GUARD_MS) {
-          notifyDone();
-        }
-      }
-
-      if (!generating && !wasGenerating) {
+      // If Generate was clicked but no generation request/progress was captured,
+      // reset the pending state. Do not notify: this is probably validation failure or UI-only activity.
+      if (!activeNetworkGeneration && pendingCaptureStartedAt > 0 && now - pendingCaptureStartedAt > PENDING_CAPTURE_TIMEOUT_MS) {
+        console.warn(`[${EXT_NAME}] generation capture timed out`);
+        resetGenerationTracking();
         generationStartTime = null;
       }
 
-      wasGenerating = generating;
-      updateElapsedLabel(generating);
+      updateElapsedLabel(activeNetworkGeneration || pendingCaptureStartedAt > 0);
       updateButtonState();
       updateSoundButtonState();
     } catch (e) {
       console.warn(`[${EXT_NAME}] loop failed`, e);
+    } finally {
+      loopBusy = false;
     }
   }
 
   function init() {
+    installNetworkHooks();
     createFloatingButton();
     setInterval(loop, CHECK_INTERVAL_MS);
     console.log(`[${EXT_NAME}] loaded`);
