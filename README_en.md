@@ -94,6 +94,9 @@ Change the IP address to match your own environment.
 
 ## Version
 
+v1.1.2
+- Fixed false completion notifications when switching Checkpoint / LoRA tabs in Forge Neo.
+- Generation completion is now detected using Gradio queue/progress state instead of noisy DOM/gallery changes.
 v1.1.1 Reduced false detections of generation completion  
 v1.1.0 Initial public release
 
