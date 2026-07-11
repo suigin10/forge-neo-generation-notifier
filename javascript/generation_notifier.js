@@ -479,8 +479,23 @@
     updateElapsedLabel(false);
   }
 
-  function markRunning(reason) {
+  function markRunning(reason, options = {}) {
     if (state === STATE_IDLE && Date.now() > captureUntil) return;
+
+    const strongEvidence = options.strongEvidence !== false;
+
+    if (/queue|process_starts|process_generating/i.test(String(reason || ""))) {
+      seenQueueRunning = true;
+    }
+
+    // A queue/join or process_starts event only proves that some Gradio task ran.
+    // During Forge Neo startup, unrelated initialization tasks can use the same queue.
+    // Keep waiting for progress API / Interrupt DOM / image output before promoting
+    // the pending Generate press to a real image-generation run.
+    if (!strongEvidence && state === STATE_PENDING) {
+      log(`weak queue activity observed via ${reason} (run ${runId})`);
+      return;
+    }
 
     if (!generationStartTime) generationStartTime = Date.now();
 
@@ -492,11 +507,6 @@
     pendingStartedAt = 0;
     captureUntil = 0;
     pendingCompletion = null;
-
-    if (/queue|process_starts|process_generating/i.test(String(reason || ""))) {
-      seenQueueRunning = true;
-    }
-
     hadRunningEvidence = true;
     updateElapsedLabel(true);
   }
@@ -872,7 +882,41 @@
 
     const id = String(eventId);
     activeQueueEventIds.add(id);
-    markRunning(`queue event ${id}`);
+    log(`captured queue candidate ${id} (run ${runId})`);
+  }
+
+  function valueLooksLikeImageOutput(value, depth = 0) {
+    if (value == null || depth > 7) return false;
+
+    if (typeof value === "string") {
+      return /^data:image\//i.test(value) ||
+        /(?:^|[\/])[^\/?#]+\.(?:png|jpe?g|webp|gif|bmp)(?:[?#].*)?$/i.test(value) ||
+        /(?:^|[?&])file=[^&]+\.(?:png|jpe?g|webp|gif|bmp)(?:&|$)/i.test(value);
+    }
+
+    if (Array.isArray(value)) {
+      return value.some((item) => valueLooksLikeImageOutput(item, depth + 1));
+    }
+
+    if (typeof value !== "object") return false;
+
+    const mime = String(value.mime_type || value.mimeType || value.type || "");
+    if (/^image\//i.test(mime)) return true;
+
+    for (const key of ["path", "url", "name", "orig_name", "data"]) {
+      if (valueLooksLikeImageOutput(value[key], depth + 1)) return true;
+    }
+
+    return Object.entries(value).some(([key, item]) => {
+      if (["path", "url", "name", "orig_name", "data", "mime_type", "mimeType", "type"].includes(key)) {
+        return false;
+      }
+      return valueLooksLikeImageOutput(item, depth + 1);
+    });
+  }
+
+  function queuePayloadHasImageOutput(payload) {
+    return valueLooksLikeImageOutput(payload?.output?.data ?? payload?.output);
   }
 
   function deferCompletion(reason, trustedQueue) {
@@ -1013,14 +1057,30 @@
     }
 
     if (/process_starts|process_generating/.test(msg)) {
-      markRunning(`queue ${msg}`);
+      markRunning(`queue ${msg}`, { strongEvidence: false });
       return;
     }
 
     if (msg === "process_completed") {
+      const knownEvent = Boolean(eventId && activeQueueEventIds.has(eventId));
+      const imageOutput = queuePayloadHasImageOutput(payload);
+
+      // A captured queue event can still belong to Forge Neo's startup work.
+      // Only an image-bearing completion may promote a still-pending click by itself.
+      // Otherwise keep the capture window alive so the real generation request can
+      // still be associated with this run.
+      if (state === STATE_PENDING) {
+        if (knownEvent && imageOutput) {
+          markRunning(`queue image output ${eventId}`);
+        } else {
+          if (knownEvent) activeQueueEventIds.delete(eventId);
+          log(`ignored queue-only completion without generation evidence${eventId ? ` (${eventId})` : ""}`);
+          return;
+        }
+      }
+
       if (state !== STATE_RUNNING && state !== STATE_STOPPING) return;
 
-      const knownEvent = Boolean(eventId && activeQueueEventIds.has(eventId));
       const mismatchedEvent = Boolean(eventId && activeQueueEventIds.size > 0 && !activeQueueEventIds.has(eventId));
 
       // Rapid Generate / Interrupt operations can make the stored event_id stale.
@@ -1311,8 +1371,8 @@
         }
 
         if (queueJoin && shouldCapture) {
-          markRunning("queue/join");
-
+          // Correlate the event_id, but do not treat queue/join itself as proof
+          // that image generation has started. Startup initialization also uses it.
           response.clone().json().then((data) => {
             captureQueueEventId(data?.event_id || data?.eventId);
           }).catch((e) => {
